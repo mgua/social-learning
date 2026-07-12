@@ -1,0 +1,22 @@
+# Normalize line endings so documents diff cleanly across Windows/macOS/Linux.
+* text=auto eol=lf
+
+# Markdown documents and code are always LF in the repo.
+*.md   text eol=lf
+*.py   text eol=lf
+*.json text eol=lf
+
+# Binary attachments must never be line-ending converted.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.webp binary
+*.svg  text eol=lf
+*.pdf  binary
+*.webm binary
+*.weba binary
+*.mp4  binary
+*.mp3  binary
+*.wav  binary
+*.ogg  binary
