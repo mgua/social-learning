@@ -9,6 +9,11 @@ The entire application — web server, HTML, CSS and JavaScript — is one file
 (`app.py`) using only the Python 3.10+ standard library. **No dependencies, no
 build step, no login.**
 
+**social-learning** has been created in 2020 by [Neta srl](https://neta.it), and 
+subsequently evolved.
+It is currently mantained by [Marco Guardigli](https://marco.guardigli.it), 
+with the help of Anthropic Claude.
+
 ## Run
 
 ```sh
@@ -42,6 +47,21 @@ content/
   the preview; YouTube links render as clickable thumbnails.
 - **Record:** 🎤 audio and 🎥 video use the browser camera/mic (`MediaRecorder`);
   the clip is saved into `content/_assets/` and embedded as a player.
+
+
+## Integrations
+
+A great integration for digital books is to use social-learning with [Calibre](https://calibre-ebook.com/) 
+by Kovid Goyal and with [Pandoc](https://pandoc.org/) by John McFarlane.
+**Calibre** allows to manage e-book collections.
+**Pandoc** allows to reformat ebooks into markdown and many other formats. Markdown 
+conversion allows to import efficiently those contents in git repos, for reading/editing
+and content updates. 
+```bash
+  # this pandoc command converts an epub ebook into markdown
+  pandoc book.epub -t gfm -o book.md, --extract-media
+```
+
 
 ## Roadmap
 
