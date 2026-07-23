@@ -330,6 +330,15 @@ HTML = r"""<!doctype html>
   #modal kbd{background:#171a20;border:1px solid var(--line);border-radius:4px;
     padding:0 5px;font-size:.85em}
   #modal code{background:#171a20;padding:1px 5px;border-radius:4px;font-size:.9em}
+  #modal a{color:var(--accent)}
+  #modal .pandoc{margin-top:18px;border-top:1px solid var(--line);padding-top:14px}
+  #modal .pandoc h3{margin-bottom:.2em}
+  #modal .pandoc .lead{margin:.2em 0 .9em}
+  #modal .pandoc b{display:block;margin:.6em 0 .2em}
+  #modal pre{background:#171a20;border:1px solid var(--line);border-radius:6px;
+    padding:8px 10px;overflow:auto;margin:.3em 0}
+  #modal pre code{background:none;padding:0;font-size:.9em}
+  #modal .note{color:var(--muted);font-size:.88em;margin:.15em 0 .3em}
   .status{color:var(--muted);font-size:12px;min-width:120px;text-align:right}
   button{background:var(--panel2);color:var(--fg);border:1px solid var(--line);
          border-radius:6px;padding:5px 10px;cursor:pointer;font-size:13px}
@@ -399,7 +408,7 @@ HTML = r"""<!doctype html>
 <body>
 <header>
   <h1>📚 social-learning</h1>
-  <a href="#" id="about" title="Features / Funzionalità">ℹ Info</a>
+  <a href="#" id="about" title="Info, help &amp; Pandoc / Info, aiuto e Pandoc">ℹ Info</a>
   <span class="sp"></span>
   <button id="mEdit" title="Editor only">✎</button>
   <button id="mSplit" class="pri" title="Split">⬍</button>
@@ -449,6 +458,84 @@ HTML = r"""<!doctype html>
               <code>content/</code>, così puoi fare commit e push del tuo lavoro.</li>
         </ul>
       </div>
+    </div>
+    <div class="pandoc">
+      <h3>🔄 Convert with Pandoc &nbsp;·&nbsp; Converti con Pandoc</h3>
+      <p class="lead">Documents here are plain markdown, so
+        <a href="https://pandoc.org/" target="_blank" rel="noopener">Pandoc</a>
+        can turn them into — and from — many other formats.
+        &nbsp;·&nbsp; I documenti qui sono semplice markdown, quindi
+        <a href="https://pandoc.org/" target="_blank" rel="noopener">Pandoc</a>
+        può trasformarli da e verso molti altri formati.</p>
+      <pre><code># install Pandoc:  sudo apt install pandoc   ·   brew install pandoc
+#                  Windows: winget install JohnMacFarlane.Pandoc  (or pandoc.org/installing)</code></pre>
+
+      <b>Markdown → Word / ODT (.docx / .odt)</b>
+      <pre><code>pandoc note.md -o note.docx    # Word
+pandoc note.md -o note.odt     # LibreOffice / OpenOffice</code></pre>
+      <p class="note">🇬🇧 Images live in <code>_assets/</code>; if they don't appear,
+        point Pandoc at them with <code>--resource-path=_assets</code> (or drop the
+        leading <code>/</code> from the paths). Add
+        <code>--reference-doc=style.docx</code> (or <code>.odt</code>) to reuse a
+        template's styles.<br>
+        🇮🇹 Le immagini sono in <code>_assets/</code>; se non compaiono, indicale con
+        <code>--resource-path=_assets</code> (o togli lo <code>/</code> iniziale dai
+        percorsi). Usa <code>--reference-doc=style.docx</code> (o <code>.odt</code>) per
+        riusare gli stili di un modello.</p>
+
+      <b>Word / ODT → Markdown (.docx / .odt)</b>
+      <pre><code>pandoc note.docx -t gfm -o note.md --extract-media=_assets
+pandoc note.odt  -t gfm -o note.md --extract-media=_assets</code></pre>
+      <p class="note">🇬🇧 Pandoc reads <code>.docx</code> and <code>.odt</code>
+        natively; <code>--extract-media</code> pulls embedded images into
+        <code>_assets/</code>. Add <code>--wrap=none</code> to keep paragraphs on
+        single lines.<br>
+        🇮🇹 Pandoc legge <code>.docx</code> e <code>.odt</code> in modo nativo;
+        <code>--extract-media</code> estrae le immagini incorporate in
+        <code>_assets/</code>. Aggiungi <code>--wrap=none</code> per tenere i paragrafi
+        su righe singole.</p>
+
+      <b>PDF → Markdown &nbsp;·&nbsp; option A — pdftotext + Pandoc (lightweight)</b>
+      <pre><code># install pdftotext (Poppler):
+#   Debian/Ubuntu   sudo apt install poppler-utils
+#   macOS (brew)    brew install poppler
+#   Windows         choco install poppler   (or: scoop install poppler)
+pdftotext book.pdf - | pandoc -t gfm -o book.md</code></pre>
+      <p class="note">🇬🇧 Pandoc can't read PDF itself — <code>pdftotext</code> (from
+        Poppler, <i>not</i> ImageMagick/Ghostscript) extracts the raw text, then Pandoc
+        formats it. Fine for clean text; complex layouts, tables and images need manual
+        cleanup. On Windows Poppler has no winget package and is fiddly — option B is
+        usually easier there.<br>
+        🇮🇹 Pandoc non legge il PDF da solo — <code>pdftotext</code> (da Poppler,
+        <i>non</i> ImageMagick/Ghostscript) estrae il testo grezzo, poi Pandoc lo
+        formatta. Va bene per testo semplice; layout complessi, tabelle e immagini
+        richiedono pulizia manuale. Su Windows Poppler non ha un pacchetto winget ed è
+        scomodo — di solito l'opzione B è più semplice.</p>
+
+      <b>PDF → Markdown &nbsp;·&nbsp; option B — LiteParse (structured output + OCR)</b>
+      <pre><code># needs Node.js — on Windows:  winget install OpenJS.NodeJS.LTS
+npm install -g @llamaindex/liteparse
+lit parse book.pdf --format markdown -o book.md</code></pre>
+      <p class="note">🇬🇧 LiteParse rebuilds headings, tables and lists from the page
+        layout and can OCR scans — all locally, no cloud or API keys. It replaces the
+        pdftotext+Pandoc step (it emits Markdown directly). For very dense tables or
+        scans, cloud tools (LlamaParse, Docling) still do better.<br>
+        🇮🇹 LiteParse ricostruisce titoli, tabelle ed elenchi dal layout della pagina e
+        può fare l'OCR delle scansioni — tutto in locale, senza cloud né chiavi API.
+        Sostituisce il passaggio pdftotext+Pandoc (produce Markdown direttamente). Per
+        tabelle molto dense o scansioni, gli strumenti cloud (LlamaParse, Docling)
+        restano migliori.</p>
+
+      <b>Ebooks (EPUB) → Markdown</b>
+      <pre><code>pandoc book.epub -t gfm -o book.md --extract-media=_assets</code></pre>
+      <p class="note">🇬🇧 <code>--extract-media</code> pulls embedded images into
+        <code>_assets/</code>. Pair with
+        <a href="https://calibre-ebook.com/" target="_blank" rel="noopener">Calibre</a>
+        to manage and convert your ebook library.<br>
+        🇮🇹 <code>--extract-media</code> estrae le immagini incorporate in
+        <code>_assets/</code>. Abbinalo a
+        <a href="https://calibre-ebook.com/" target="_blank" rel="noopener">Calibre</a>
+        per gestire e convertire la tua libreria di ebook.</p>
     </div>
   </div>
 </div>
@@ -844,4 +931,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
