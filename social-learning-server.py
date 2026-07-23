@@ -2,8 +2,10 @@
 """
 social-learning — a compact, single-file document manager.
 
-Run locally:   python3 app.py            (opens http://127.0.0.1:8000)
-               python3 app.py --port 9000 --no-open
+Run locally:   python3 app.py                    (opens http://127.0.0.1:8000)
+               python3 app.py --host 0.0.0.0 --port 9000
+               python3 app.py --dir ./notes      (serve a different folder)
+               python3 app.py --noprompt --no-open   (for scripts / CI)
 
 Content lives as plain files in this repo, so it is git-trackable and
 contributors can just push new documents:
@@ -29,8 +31,9 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 
-BASE = os.path.dirname(os.path.abspath(__file__))
-CONTENT = os.path.join(BASE, "content")
+# CONTENT (and its _assets subfolder) are set from the command line in main().
+# Default is ./content, resolved against the current working directory.
+CONTENT = os.path.realpath("content")
 ASSETS = os.path.join(CONTENT, "_assets")
 
 mimetypes.add_type("text/markdown", ".md")
@@ -793,16 +796,44 @@ loadTree(); render(); markSaved();
 
 # --------------------------------------------------------------------------- #
 def main():
+    global CONTENT, ASSETS
     ap = argparse.ArgumentParser(description="social-learning document manager")
-    ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="IP address to bind (default 127.0.0.1)")
+    ap.add_argument("--port", type=int, default=8000,
+                    help="TCP port to serve on (default 8000)")
+    ap.add_argument("--dir", default="content", metavar="FOLDER",
+                    help="folder to serve (default ./content)")
+    ap.add_argument("--noprompt", action="store_true",
+                    help="start serving immediately, without waiting for Enter")
     ap.add_argument("--no-open", action="store_true", help="don't open a browser")
     args = ap.parse_args()
 
-    ensure_dirs()
-    httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+    CONTENT = os.path.realpath(args.dir)
+    ASSETS = os.path.join(CONTENT, "_assets")
     url = f"http://{args.host}:{args.port}/"
-    print(f"social-learning serving {CONTENT}\n  {url}\n(Ctrl+C to stop)")
+
+    print("social-learning")
+    print(f"  content : {CONTENT}")
+    print(f"  address : {url}")
+
+    if not args.noprompt:
+        try:
+            input("Press Enter to start serving (Ctrl+C to cancel)... ")
+        except EOFError:
+            pass                      # no interactive stdin (piped / CI) — proceed
+        except KeyboardInterrupt:
+            print("\ncancelled")
+            return
+
+    ensure_dirs()
+    try:
+        httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+    except OSError as e:
+        print(f"cannot bind {args.host}:{args.port}: {e}")
+        return
+
+    print(f"serving {url} (Ctrl+C to stop)")
     if not args.no_open:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     try:
@@ -813,3 +844,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
