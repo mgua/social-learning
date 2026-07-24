@@ -1,0 +1,5 @@
+digraph {
+  Draft -> Submitted   [label="submit"];
+  Submitted -> Approved [label="approve"];
+  Submitted -> Draft    [label="revise"];
+}

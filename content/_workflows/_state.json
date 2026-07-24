@@ -1,0 +1,10 @@
+{
+  "credits.md": {
+    "workflow": "mgwf01",
+    "state": "Submitted"
+  },
+  "welcome.md": {
+    "workflow": "mgwf01",
+    "state": "Approved"
+  }
+}
