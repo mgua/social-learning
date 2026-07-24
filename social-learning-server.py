@@ -436,7 +436,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True, "name": new})
 
             if path == "/api/upload":
-                fn = unique_asset_name(self.headers.get("X-Filename", "file"))
+                # X-Filename is percent-encoded by the client (headers are latin-1)
+                fn = unique_asset_name(
+                    unquote(self.headers.get("X-Filename", "file")))
                 dest = os.path.join(ASSETS, fn)
                 with open(dest, "wb") as f:
                     f.write(self._body())
@@ -542,12 +544,19 @@ HTML = r"""<!doctype html>
         display:flex;flex-direction:column;min-height:0}
   #side .bar{display:flex;gap:6px;padding:8px;border-bottom:1px solid var(--line)}
   #side .bar button{flex:1;padding:5px 4px;font-size:12px}
+  #side .bar #upDir,#side .bar #refresh{flex:0 0 28px}
+  #cwdbar{padding:4px 10px;font-size:11px;color:var(--muted);
+          border-bottom:1px solid var(--line);white-space:nowrap;overflow:hidden;
+          text-overflow:ellipsis}
+  #cwdbar #cwd{color:var(--accent)}
   #tree{flex:1;overflow:auto;padding:6px}
   .node{user-select:none}
   .row{display:flex;align-items:center;gap:5px;padding:3px 6px;border-radius:5px;
        cursor:pointer;white-space:nowrap}
   .row:hover{background:var(--panel2)}
   .row.sel{background:var(--accent);color:#0b1220}
+  /* the folder new documents/folders will be created in */
+  .row.cwd{background:var(--panel2);outline:1px solid var(--accent)}
   .row .tw{width:12px;color:var(--muted);text-align:center}
   .row .ic{width:16px;text-align:center}
   .row .nm{flex:1;overflow:hidden;text-overflow:ellipsis}
@@ -566,6 +575,7 @@ HTML = r"""<!doctype html>
   #editor{display:flex}
   #ta{flex:1;resize:none;border:0;outline:0;padding:16px;background:var(--bg);
       color:var(--fg);font:13px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace}
+  #ta.drop{outline:2px dashed var(--accent);outline-offset:-4px}
   #preview{padding:16px 26px;border-left:1px solid var(--line);background:#20242c}
   #panes.epreview #editor{display:none}
   #panes.eonly #preview{display:none}
@@ -809,8 +819,10 @@ lit parse book.pdf --format markdown -o book.md</code></pre>
     <div class="bar">
       <button id="newDoc">+ Doc</button>
       <button id="newDir">+ Folder</button>
+      <button id="upDir" title="Leave this folder">↑</button>
       <button id="refresh" title="Reload tree">⟳</button>
     </div>
+    <div id="cwdbar">in <span id="cwd">content/</span></div>
     <div id="tree"></div>
   </nav>
   <section id="work">
@@ -820,6 +832,8 @@ lit parse book.pdf --format markdown -o book.md</code></pre>
       <span id="wfCur" class="wfcur" hidden></span>
       <select id="wfState" title="Advance to the next state" hidden></select>
       <button id="metaBtn" title="Document metadata &amp; history" disabled>🕑</button>
+      <button id="attachBtn" title="Attach a file of any type">📎</button>
+      <input id="attachInput" type="file" multiple hidden>
       <button id="recAudio" title="Record audio">🎤</button>
       <button id="recVideo" title="Record video">🎥</button>
       <button id="save" class="pri">Save</button>
@@ -862,8 +876,11 @@ const api = {
                 body:JSON.stringify(d)}).then(r => r.json()),
   del:       p => fetch("/api/doc?path=" + encodeURIComponent(p),
                 {method:"DELETE"}).then(r => r.json()),
+  // the filename travels in a header, so percent-encode it: HTTP headers are
+  // latin-1 and fetch throws on accented/non-ASCII names otherwise
   upload:    (blob, name) => fetch("/api/upload", {method:"POST",
-                headers:{"X-Filename":name}, body:blob}).then(r => r.json()),
+                headers:{"X-Filename":encodeURIComponent(name)},
+                body:blob}).then(r => r.json()),
   workflows: () => fetch("/api/workflows").then(r => r.json()),
   workflow:  n => fetch("/api/workflow?name=" + encodeURIComponent(n)).then(r => r.text()),
   saveWf:    (n, t) => fetch("/api/workflow?name=" + encodeURIComponent(n),
@@ -883,7 +900,8 @@ const api = {
    comes from the server. If no username is set, the server falls back to IP. */
 function getUser(){ return ($("#userName").value || "").trim(); }
 
-let state = {path:null, dirty:false, open:{}};
+// state.dir = the folder new documents/folders go into ("" = content root)
+let state = {path:null, dir:"", dirty:false, open:{}};
 const ta = $("#ta"), preview = $("#preview"), status = $("#status");
 
 /* ------------------------------------------------------------ workflows --- */
@@ -952,6 +970,7 @@ async function loadTree(){
   await Promise.all([...needed].map(getWf));
   const el = $("#tree"); el.innerHTML = "";
   el.appendChild(renderNodes(data, ""));
+  $("#cwd").textContent = state.dir || "content/";
   refreshDocWorkflowUI();
 }
 function renderNodes(nodes, parent){
@@ -984,6 +1003,7 @@ function renderNodes(nodes, parent){
     act.append(ren, del); row.append(act);
     node.append(row);
     if(state.path === n.path) row.classList.add("sel");
+    if(isDir){ row.dataset.dir = n.path; if(state.dir === n.path) row.classList.add("cwd"); }
 
     if(isDir){
       tw.textContent = state.open[n.path] ? "▾" : "▸";
@@ -993,9 +1013,14 @@ function renderNodes(nodes, parent){
       node.append(kids);
       row.onclick = e => {
         if(e.target === ren || e.target === del) return;
-        state.open[n.path] = !state.open[n.path];
+        // clicking the twisty folds; clicking the name enters the folder
+        // (clicking the name of the folder you are already in folds it too)
+        if(e.target === tw || state.dir === n.path)
+          state.open[n.path] = !state.open[n.path];
+        else { state.dir = n.path; state.open[n.path] = true; }
         tw.textContent = state.open[n.path] ? "▾" : "▸";
         kids.style.display = state.open[n.path] ? "" : "none";
+        markCwd();
       };
     } else {
       row.onclick = e => { if(e.target!==ren && e.target!==del) openDoc(n.path); };
@@ -1008,6 +1033,9 @@ function renderNodes(nodes, parent){
         const r = await api.rename({path:n.path, name:nv});
         if(r.error) return alert(r.error);
         if(state.path === n.path) state.path = r.path;
+        if(state.dir === n.path) state.dir = r.path;
+        else if(state.dir.startsWith(n.path + "/"))
+          state.dir = r.path + state.dir.slice(n.path.length);
         await loadTree(); if(state.path===r.path) openDoc(r.path);
       }
     };
@@ -1016,6 +1044,10 @@ function renderNodes(nodes, parent){
       if(!confirm("Delete \"" + n.name + "\"" + (isDir?" and everything inside?":"?"))) return;
       await api.del(n.path);
       if(state.path === n.path){ state.path=null; ta.value=""; render(); setPath(); }
+      // don't leave the current folder pointing at something deleted
+      if(state.dir === n.path || state.dir.startsWith(n.path + "/"))
+        state.dir = n.path.includes("/") ?
+          n.path.split("/").slice(0,-1).join("/") : "";
       loadTree();
     };
     frag.append(node);
@@ -1023,10 +1055,20 @@ function renderNodes(nodes, parent){
   return frag;
 }
 
+// re-paint the "current folder" outline without rebuilding the tree
+function markCwd(){
+  for(const r of document.querySelectorAll("#tree .row"))
+    r.classList.toggle("cwd", r.dataset.dir !== undefined &&
+                              r.dataset.dir === state.dir);
+  $("#cwd").textContent = state.dir || "content/";
+}
+
 /* ------------------------------------------------------------- document --- */
 async function openDoc(path){
   if(state.dirty && !confirm("Discard unsaved changes?")) return;
   state.path = path; state.dirty = false;
+  // opening a document makes its folder the current one
+  state.dir = path.includes("/") ? path.split("/").slice(0,-1).join("/") : "";
   ta.value = await api.doc(path);
   render(); setPath(); loadTree();
 }
@@ -1062,6 +1104,7 @@ function setReadOnly(ro){
   docReadOnly = ro;
   ta.readOnly = ro; ta.classList.toggle("ro", ro);
   $("#save").disabled = ro; $("#recAudio").disabled = ro; $("#recVideo").disabled = ro;
+  $("#attachBtn").disabled = ro;
   if(ro){ clearTimeout(saveTimer); if(state.dirty){ state.dirty = false; markSaved(); } }
 }
 async function refreshDocWorkflowUI(){
@@ -1167,25 +1210,30 @@ $("#closeMeta").onclick = () => { $("#meta").hidden = true; };
 $("#meta").onclick = e => { if(e.target === $("#meta")) $("#meta").hidden = true; };
 
 /* --------------------------------------------------------- new / toolbar --- */
-function selectedDir(){
-  // create inside the selected folder, or the folder of the current doc
-  if(state.path){
-    return state.path.includes("/") ?
-      state.path.split("/").slice(0,-1).join("/") : "";
-  }
-  return "";
-}
+// the folder new items are created in: whatever folder was last entered
+function selectedDir(){ return state.dir || ""; }
 $("#newDoc").onclick = async () => {
-  const name = prompt("New document name:"); if(!name) return;
+  const name = prompt("New document in " + (state.dir || "content/") + ":");
+  if(!name) return;
   const r = await api.create({parent:selectedDir(), name, type:"file"});
   if(r.error) return alert(r.error);
   await loadTree(); openDoc(r.path);
 };
 $("#newDir").onclick = async () => {
-  const name = prompt("New folder name:"); if(!name) return;
+  const name = prompt("New folder in " + (state.dir || "content/") + ":");
+  if(!name) return;
   const r = await api.create({parent:selectedDir(), name, type:"dir"});
   if(r.error) return alert(r.error);
-  state.open[r.path]=true; loadTree();
+  // enter the folder we just created so the next item lands inside it
+  state.dir = r.path; state.open[r.path] = true;
+  loadTree();
+};
+// leave the current folder (go to its parent)
+$("#upDir").onclick = () => {
+  if(!state.dir) return;
+  state.dir = state.dir.includes("/") ?
+    state.dir.split("/").slice(0,-1).join("/") : "";
+  loadTree();
 };
 $("#refresh").onclick = loadTree;
 $("#save").onclick = save;
@@ -1230,14 +1278,38 @@ ta.addEventListener("paste", async e => {
   for(const f of files) await uploadAndInsert(f, f.type.startsWith("image/"));
 });
 async function uploadAndInsert(blob, asImage){
+  if(docReadOnly){ alert("Document is read-only (terminal state)."); return; }
+  if(!state.path){ alert("Open a document first."); return; }
   const name = blob.name || ("paste-" + Date.now() +
       (asImage ? ".png" : (blob.type.split("/")[1] ? "."+blob.type.split("/")[1] : "")));
   status.textContent = "uploading…";
   const r = await api.upload(blob, name);
-  if(r.error){ alert(r.error); return; }
+  if(r.error){ status.textContent = "upload failed"; alert(r.error); return; }
   const label = blob.name || name;
   insertAtCursor(asImage ? `![${label}](${r.url})\n` : `[${label}](${r.url})\n`);
 }
+
+/* --------------------------------------------------- attach any file ------ */
+$("#attachBtn").onclick = () => $("#attachInput").click();
+$("#attachInput").onchange = async e => {
+  for(const f of e.target.files) await uploadAndInsert(f, f.type.startsWith("image/"));
+  e.target.value = "";                       // allow re-picking the same file
+};
+/* drag a file of any type onto the editor */
+for(const ev of ["dragenter","dragover"]) ta.addEventListener(ev, e => {
+  if(!e.dataTransfer || !e.dataTransfer.types.includes("Files")) return;
+  e.preventDefault(); e.dataTransfer.dropEffect = "copy";
+  ta.classList.add("drop");
+});
+for(const ev of ["dragleave","dragend"]) ta.addEventListener(ev,
+  () => ta.classList.remove("drop"));
+ta.addEventListener("drop", async e => {
+  const files = e.dataTransfer ? [...e.dataTransfer.files] : [];
+  ta.classList.remove("drop");
+  if(!files.length) return;                  // dropped text/URL → default drop
+  e.preventDefault();
+  for(const f of files) await uploadAndInsert(f, f.type.startsWith("image/"));
+});
 
 /* ---------------------------------------------------------- recording ----- */
 let media = null;
