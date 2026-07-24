@@ -158,14 +158,43 @@ def save_state(data):
         f.write("\n")
 
 
-def set_doc_state(key, workflow, state):
-    """Set (or, with a falsy workflow, clear) a document's workflow state."""
+def now_stamp():
+    return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+
+
+def record_created(key, by):
+    """Note who first created a document and when (once, at creation time)."""
     with STATE_LOCK:
         data = load_state()
+        entry = data.setdefault(key, {})
+        if "created" not in entry:
+            entry["created"] = {"by": by, "at": now_stamp()}
+            save_state(data)
+
+
+def set_doc_state(key, workflow, state, event, terminal, by):
+    """Assign/advance a document's workflow state, or (falsy workflow) clear it.
+
+    Appends a {state, event, by, at} record to the document's history on every
+    change; the per-document `created` record (if any) is always preserved.
+    """
+    with STATE_LOCK:
+        data = load_state()
+        entry = data.get(key, {})
         if workflow:
-            data[key] = {"workflow": workflow, "state": state}
-        else:
-            data.pop(key, None)
+            entry["workflow"] = workflow
+            entry["state"] = state
+            entry["terminal"] = bool(terminal)
+            entry.setdefault("history", []).append(
+                {"state": state, "event": event, "by": by, "at": now_stamp()})
+            data[key] = entry
+        else:                                   # unassign: keep only `created`
+            for k in ("workflow", "state", "terminal", "history"):
+                entry.pop(k, None)
+            if entry:
+                data[key] = entry
+            else:
+                data.pop(key, None)
         save_state(data)
         return data.get(key)
 
@@ -245,6 +274,10 @@ class Handler(BaseHTTPRequestHandler):
     def _query(self):
         return parse_qs(urlparse(self.path).query)
 
+    def _who(self):
+        """Resolve the acting user: the X-User header, else the client IP."""
+        return self.headers.get("X-User", "").strip() or self.client_address[0]
+
     # -- static file serving (with Range support for media) --------------- #
     def _serve_file(self, full):
         if not os.path.isfile(full):
@@ -296,6 +329,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, f.read(), "text/plain; charset=utf-8")
             if path == "/api/state":
                 return self._json(load_state())
+            if path == "/api/whoami":
+                return self._json({"ip": self.client_address[0]})
             if path.startswith("/content/"):
                 return self._serve_file(safe_join(path[len("/content/"):]))
             return self._error(404, "not found")
@@ -316,6 +351,10 @@ class Handler(BaseHTTPRequestHandler):
                 full = safe_join(rel)
                 if not full.lower().endswith(".md"):
                     return self._error(400, "only .md documents")
+                key = os.path.relpath(full, CONTENT).replace(os.sep, "/")
+                entry = load_state().get(key)
+                if entry and entry.get("terminal"):
+                    return self._error(403, "document is read-only (terminal state)")
                 os.makedirs(os.path.dirname(full), exist_ok=True)
                 with open(full, "w", encoding="utf-8") as f:
                     f.write(self._body().decode("utf-8"))
@@ -333,7 +372,10 @@ class Handler(BaseHTTPRequestHandler):
                 data = json.loads(self._body() or b"{}")
                 wf = (data.get("workflow") or "").strip()
                 st = (data.get("state") or "").strip()
-                return self._json({"ok": True, "state": set_doc_state(key, wf, st)})
+                ev = (data.get("event") or "").strip()
+                term = bool(data.get("terminal"))
+                entry = set_doc_state(key, wf, st, ev, term, self._who())
+                return self._json({"ok": True, "state": entry})
             return self._error(404, "not found")
         except ValueError as e:
             return self._error(400, str(e))
@@ -361,8 +403,9 @@ class Handler(BaseHTTPRequestHandler):
                 if not os.path.exists(full):
                     with open(full, "w", encoding="utf-8") as f:
                         f.write(f"# {name}\n\n")
-                return self._json({"ok": True, "path":
-                                   os.path.relpath(full, CONTENT).replace(os.sep, "/")})
+                key = os.path.relpath(full, CONTENT).replace(os.sep, "/")
+                record_created(key, self._who())
+                return self._json({"ok": True, "path": key})
 
             if path == "/api/rename":
                 data = json.loads(self._body() or b"{}")
@@ -590,6 +633,30 @@ HTML = r"""<!doctype html>
   .row .wf.moving{background:var(--accent);color:#0b1220}
   .row .wf.done{background:var(--panel2);color:var(--ok);border:1px solid var(--line)}
   .row.sel .wf.moving{background:#0b1220;color:var(--accent)}
+  /* header identity boxes */
+  header .hbox{display:flex;align-items:center;gap:4px;font-size:12px;
+    color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:2px 6px}
+  header .hbox input{background:transparent;border:0;outline:0;color:var(--fg);
+    font:12px/1.4 system-ui,sans-serif;width:88px}
+  header #clientIp{color:var(--fg);font-family:ui-monospace,monospace;font-size:11px}
+  /* read-only (terminal) document */
+  button:disabled,select:disabled{opacity:.45;cursor:not-allowed}
+  button:disabled:hover{border-color:var(--line)}
+  #ta.ro{background:#22262e;color:var(--muted);cursor:not-allowed}
+  /* metadata modal */
+  #meta{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;
+    align-items:center;justify-content:center;z-index:50;padding:20px}
+  #meta[hidden]{display:none}
+  #meta .box{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    max-width:520px;width:100%;max-height:90vh;overflow:auto;padding:22px 26px;position:relative}
+  #meta .x{position:absolute;top:12px;right:12px;padding:2px 9px}
+  #meta h2{margin:.1em 0 .7em}
+  #meta h3{margin:1em 0 .3em;font-size:13px;color:var(--muted)}
+  #meta .mrow{display:flex;gap:10px;margin:.35em 0}
+  #meta .mrow .ml{color:var(--muted);min-width:86px}
+  #meta ol.mhist{margin:.3em 0;padding-left:20px}
+  #meta ol.mhist li{margin:.5em 0}
+  #meta .ct{color:var(--muted)}
 </style>
 </head>
 <body>
@@ -597,6 +664,9 @@ HTML = r"""<!doctype html>
   <h1>📚 social-learning</h1>
   <a href="#" id="about" title="Info, help &amp; Pandoc / Info, aiuto e Pandoc">ℹ Info</a>
   <a href="#" id="openWf" title="Define and edit workflows / Definisci e modifica i flussi">🔀 Workflows</a>
+  <label class="hbox" title="Your name — used in document history / Il tuo nome — usato nella cronologia">👤
+    <input id="userName" placeholder="username" spellcheck="false" autocomplete="off"></label>
+  <span class="hbox ip" title="Your client IP address / Il tuo indirizzo IP">🌐 <span id="clientIp">…</span></span>
   <span class="sp"></span>
   <button id="mEdit" title="Editor only">✎</button>
   <button id="mSplit" class="pri" title="Split">⬍</button>
@@ -727,6 +797,13 @@ lit parse book.pdf --format markdown -o book.md</code></pre>
     </div>
   </div>
 </div>
+<div id="meta" hidden>
+  <div class="box">
+    <button class="x" id="closeMeta" title="Close">✕</button>
+    <h2>🕑 Document metadata</h2>
+    <div id="metaBody"></div>
+  </div>
+</div>
 <main>
   <nav id="side">
     <div class="bar">
@@ -742,6 +819,7 @@ lit parse book.pdf --format markdown -o book.md</code></pre>
       <select id="wfAssign" title="Assign a workflow to this document" disabled></select>
       <span id="wfCur" class="wfcur" hidden></span>
       <select id="wfState" title="Advance to the next state" hidden></select>
+      <button id="metaBtn" title="Document metadata &amp; history" disabled>🕑</button>
       <button id="recAudio" title="Record audio">🎤</button>
       <button id="recVideo" title="Record video">🎥</button>
       <button id="save" class="pri">Save</button>
@@ -779,7 +857,7 @@ const api = {
   save:      (p, t) => fetch("/api/doc?path=" + encodeURIComponent(p),
                 {method:"PUT", body:t}).then(r => r.json()),
   create:    d => fetch("/api/create", {method:"POST",
-                body:JSON.stringify(d)}).then(r => r.json()),
+                headers:{"X-User":getUser()}, body:JSON.stringify(d)}).then(r => r.json()),
   rename:    d => fetch("/api/rename", {method:"POST",
                 body:JSON.stringify(d)}).then(r => r.json()),
   del:       p => fetch("/api/doc?path=" + encodeURIComponent(p),
@@ -796,8 +874,14 @@ const api = {
                 {method:"DELETE"}).then(r => r.json()),
   states:    () => fetch("/api/state").then(r => r.json()),
   setState:  (p, o) => fetch("/api/state?path=" + encodeURIComponent(p),
-                {method:"PUT", body:JSON.stringify(o)}).then(r => r.json()),
+                {method:"PUT", headers:{"X-User":getUser()},
+                 body:JSON.stringify(o)}).then(r => r.json()),
+  whoami:    () => fetch("/api/whoami").then(r => r.json()),
 };
+
+/* Identity: the username lives in the header box (persisted); the client IP
+   comes from the server. If no username is set, the server falls back to IP. */
+function getUser(){ return ($("#userName").value || "").trim(); }
 
 let state = {path:null, dirty:false, open:{}};
 const ta = $("#ta"), preview = $("#preview"), status = $("#status");
@@ -955,7 +1039,7 @@ function markSaved(ok){
   status.style.color = ok===false ? "var(--danger)" : "var(--muted)";
 }
 async function save(){
-  if(!state.path) return;
+  if(!state.path || docReadOnly) return;
   const r = await api.save(state.path, ta.value);
   if(r && r.ok){ state.dirty=false; markSaved(true); }
   else markSaved(false);
@@ -967,14 +1051,28 @@ ta.addEventListener("input", () => {
 });
 
 /* ------------------------------------------- document workflow / state --- */
+let docReadOnly = false;
+// states that can transition INTO a terminal state — where a "reopen" leads
+function predecessors(wf, s){
+  const p = [...new Set(wf.transitions.filter(t => t.to === s).map(t => t.from))];
+  if(!p.length){ const start = wfStart(wf); if(start && start !== s) return [start]; }
+  return p;
+}
+function setReadOnly(ro){
+  docReadOnly = ro;
+  ta.readOnly = ro; ta.classList.toggle("ro", ro);
+  $("#save").disabled = ro; $("#recAudio").disabled = ro; $("#recVideo").disabled = ro;
+  if(ro){ clearTimeout(saveTimer); if(state.dirty){ state.dirty = false; markSaved(); } }
+}
 async function refreshDocWorkflowUI(){
   const asg = $("#wfAssign"), stSel = $("#wfState"), cur = $("#wfCur");
   asg.innerHTML = "";
   asg.append(new Option("— no workflow —", ""));
   for(const n of wfNames) asg.append(new Option(n, n));
+  $("#metaBtn").disabled = !state.path;
   if(!state.path){
     asg.disabled = true; asg.value = ""; cur.hidden = true; stSel.hidden = true;
-    return;
+    setReadOnly(false); return;
   }
   asg.disabled = false;
   const info = stateMap[state.path];
@@ -984,33 +1082,89 @@ async function refreshDocWorkflowUI(){
     const term = isTerminal(wf, info.state);
     cur.hidden = false; cur.textContent = info.state;
     cur.className = "wfcur " + (term ? "done" : "moving");
-    const opts = allowedFrom(wf, info.state);
     stSel.innerHTML = "";
-    stSel.append(new Option(opts.length ? "Advance…" : "✓ terminal", ""));
-    for(const t of opts)
-      stSel.append(new Option((t.event ? t.event + " → " : "→ ") + t.to, t.to));
-    stSel.disabled = !opts.length; stSel.hidden = false;
+    if(term){                                    // terminal → offer to reopen
+      const preds = predecessors(wf, info.state);
+      stSel.append(new Option(preds.length ? "Reopen…" : "✓ terminal", ""));
+      for(const p of preds) stSel.append(new Option("↩ " + p, p));
+      stSel.disabled = !preds.length; stSel.dataset.mode = "reopen";
+    } else {                                     // otherwise → allowed advances
+      const opts = allowedFrom(wf, info.state);
+      stSel.append(new Option("Advance…", ""));
+      for(const t of opts)
+        stSel.append(new Option((t.event ? t.event + " → " : "→ ") + t.to, t.to));
+      stSel.disabled = !opts.length; stSel.dataset.mode = "advance";
+    }
+    stSel.hidden = false;
+    setReadOnly(term);
   } else {
-    cur.hidden = true; stSel.hidden = true;
+    cur.hidden = true; stSel.hidden = true; setReadOnly(false);
   }
 }
 $("#wfAssign").onchange = async () => {
   if(!state.path) return;
   const name = $("#wfAssign").value;
-  let st = "";
-  if(name){ const wf = await getWf(name); st = wfStart(wf); }
-  const r = await api.setState(state.path, {workflow:name, state:st});
+  let st = "", term = false;
+  if(name){ const wf = await getWf(name); st = wfStart(wf); term = isTerminal(wf, st); }
+  const r = await api.setState(state.path,
+    {workflow:name, state:st, event:"", terminal:term});
   if(r.error) return alert(r.error);
   await loadTree();
 };
 $("#wfState").onchange = async () => {
-  if(!state.path) return;
-  const to = $("#wfState").value; if(!to) return;
-  const info = stateMap[state.path]; if(!info) return;
-  const r = await api.setState(state.path, {workflow:info.workflow, state:to});
+  const to = $("#wfState").value; if(!to || !state.path) return;
+  const info = stateMap[state.path]; if(!info || !info.workflow) return;
+  const wf = await getWf(info.workflow);
+  const reopen = $("#wfState").dataset.mode === "reopen";
+  const tr = wf.transitions.find(t => t.from === info.state && t.to === to);
+  const event = reopen ? "reopen" : (tr ? tr.event : "");
+  const r = await api.setState(state.path,
+    {workflow:info.workflow, state:to, event, terminal:isTerminal(wf, to)});
   if(r.error) return alert(r.error);
   await loadTree();
 };
+
+/* --------------------------------------------------- metadata / history --- */
+function showMeta(){
+  const b = $("#metaBody");
+  const info = state.path ? stateMap[state.path] : null;
+  if(!state.path){ b.innerHTML = '<p class="ct">No document selected.</p>'; }
+  else {
+    let h = '<div class="mrow"><span class="ml">Document</span><span>' +
+      escHtml(state.path) + "</span></div>";
+    h += '<div class="mrow"><span class="ml">Created</span><span>' +
+      (info && info.created
+        ? escHtml(info.created.at) + " · by " + escHtml(info.created.by)
+        : '<span class="ct">unknown</span>') + "</span></div>";
+    if(info && info.workflow){
+      h += '<div class="mrow"><span class="ml">Workflow</span><span>' +
+        escHtml(info.workflow) + "</span></div>";
+      h += '<div class="mrow"><span class="ml">State</span><span>' +
+        escHtml(info.state) + (info.terminal ? " (terminal · read-only)" : "") +
+        "</span></div>";
+      const hist = info.history || [];
+      h += "<h3>State history</h3>";
+      if(!hist.length) h += '<p class="ct">no transitions recorded</p>';
+      else {
+        h += '<ol class="mhist">';
+        for(const e of hist){
+          const lbl = e.event ? escHtml(e.event) + " → " + escHtml(e.state)
+                              : escHtml(e.state);
+          h += "<li><b>" + lbl + "</b><br><span class=\"ct\">" +
+            escHtml(e.at) + " · by " + escHtml(e.by) + "</span></li>";
+        }
+        h += "</ol>";
+      }
+    } else {
+      h += '<p class="ct">No workflow assigned.</p>';
+    }
+    b.innerHTML = h;
+  }
+  $("#meta").hidden = false;
+}
+$("#metaBtn").onclick = showMeta;
+$("#closeMeta").onclick = () => { $("#meta").hidden = true; };
+$("#meta").onclick = e => { if(e.target === $("#meta")) $("#meta").hidden = true; };
 
 /* --------------------------------------------------------- new / toolbar --- */
 function selectedDir(){
@@ -1039,7 +1193,7 @@ $("#about").onclick = e => { e.preventDefault(); $("#modal").hidden = false; };
 $("#closeAbout").onclick = () => { $("#modal").hidden = true; };
 $("#modal").onclick = e => { if(e.target === $("#modal")) $("#modal").hidden = true; };
 document.addEventListener("keydown", e => {
-  if(e.key === "Escape") $("#modal").hidden = true;
+  if(e.key === "Escape"){ $("#modal").hidden = true; $("#meta").hidden = true; }
 });
 $("#mEdit").onclick  = () => setMode("eonly", "#mEdit");
 $("#mSplit").onclick = () => setMode("split", "#mSplit");
@@ -1058,6 +1212,7 @@ window.addEventListener("beforeunload", e => {
 
 /* ------------------------------------------------------- insert at caret -- */
 function insertAtCursor(text){
+  if(docReadOnly) return;
   const s = ta.selectionStart, e = ta.selectionEnd;
   ta.value = ta.value.slice(0,s) + text + ta.value.slice(e);
   ta.selectionStart = ta.selectionEnd = s + text.length;
@@ -1087,6 +1242,7 @@ async function uploadAndInsert(blob, asImage){
 /* ---------------------------------------------------------- recording ----- */
 let media = null;
 async function record(kind){
+  if(docReadOnly){ alert("Document is read-only (terminal state)."); return; }
   if(media){ media.stop(); return; }              // toggle off
   let stream;
   try{
@@ -1306,8 +1462,15 @@ $("#wfDelete").onclick = async () => {
   selectWf(wfNames[0] || null);
 };
 
+/* ------------------------------------------------------------- identity --- */
+$("#userName").value = localStorage.getItem("sl-user") || "";
+$("#userName").addEventListener("input", () =>
+  localStorage.setItem("sl-user", $("#userName").value));
+
 /* --------------------------------------------------------------- boot ----- */
 (async function boot(){
+  api.whoami().then(w => { $("#clientIp").textContent = (w && w.ip) || "?"; })
+             .catch(() => { $("#clientIp").textContent = "?"; });
   await loadWorkflows();
   await loadTree();
   render(); markSaved();
