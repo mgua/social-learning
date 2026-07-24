@@ -35,6 +35,11 @@ from urllib.parse import urlparse, parse_qs, unquote
 # Default is ./content, resolved against the current working directory.
 CONTENT = os.path.realpath("content")
 ASSETS = os.path.join(CONTENT, "_assets")
+WORKFLOWS = os.path.join(CONTENT, "_workflows")
+STATE_FILE = os.path.join(WORKFLOWS, "_state.json")
+
+# _state.json is read-modify-written from several worker threads.
+STATE_LOCK = threading.Lock()
 
 mimetypes.add_type("text/markdown", ".md")
 mimetypes.add_type("video/webm", ".webm")
@@ -46,6 +51,7 @@ mimetypes.add_type("audio/webm", ".weba")
 # --------------------------------------------------------------------------- #
 def ensure_dirs():
     os.makedirs(ASSETS, exist_ok=True)
+    os.makedirs(WORKFLOWS, exist_ok=True)
 
 
 def safe_join(rel):
@@ -65,7 +71,7 @@ def build_tree(path):
     except FileNotFoundError:
         return entries
     for name in names:
-        if name.startswith(".") or name == "_assets":
+        if name.startswith(".") or name in ("_assets", "_workflows"):
             continue
         full = os.path.join(path, name)
         rel = os.path.relpath(full, CONTENT).replace(os.sep, "/")
@@ -113,6 +119,95 @@ def clean_name(name):
     if len(name) > 200:
         raise ValueError("name too long")
     return name
+
+
+# --------------------------------------------------------------------------- #
+# Workflows and per-document state
+#
+# Workflow definitions are Graphviz-DOT text files in _workflows/ (referenced
+# by name, without the .dot extension). Each document's assigned workflow and
+# current state live in a single sidecar _workflows/_state.json, so .md files
+# stay pure markdown. All reads/writes of that file take STATE_LOCK.
+# --------------------------------------------------------------------------- #
+def workflow_path(name):
+    """Resolve a workflow name to its .dot file (validated, inside content)."""
+    return safe_join("_workflows/" + clean_name(name) + ".dot")
+
+
+def list_workflows():
+    try:
+        names = os.listdir(WORKFLOWS)
+    except FileNotFoundError:
+        return []
+    return sorted(n[:-4] for n in names if n.lower().endswith(".dot"))
+
+
+def load_state():
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def save_state(data):
+    os.makedirs(WORKFLOWS, exist_ok=True)
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+
+def set_doc_state(key, workflow, state):
+    """Set (or, with a falsy workflow, clear) a document's workflow state."""
+    with STATE_LOCK:
+        data = load_state()
+        if workflow:
+            data[key] = {"workflow": workflow, "state": state}
+        else:
+            data.pop(key, None)
+        save_state(data)
+        return data.get(key)
+
+
+def rekey_state(oldkey, newkey):
+    """Move state entries when a document/folder is renamed."""
+    with STATE_LOCK:
+        data = load_state()
+        changed = False
+        for k in list(data.keys()):
+            if k == oldkey:
+                data[newkey] = data.pop(k)
+                changed = True
+            elif k.startswith(oldkey + "/"):
+                data[newkey + k[len(oldkey):]] = data.pop(k)
+                changed = True
+        if changed:
+            save_state(data)
+
+
+def drop_state(key):
+    """Remove state entries for a deleted document/folder."""
+    with STATE_LOCK:
+        data = load_state()
+        removed = [k for k in data if k == key or k.startswith(key + "/")]
+        for k in removed:
+            data.pop(k, None)
+        if removed:
+            save_state(data)
+
+
+def rename_workflow_refs(old, new):
+    """Re-point document state entries after a workflow itself is renamed."""
+    with STATE_LOCK:
+        data = load_state()
+        changed = False
+        for v in data.values():
+            if isinstance(v, dict) and v.get("workflow") == old:
+                v["workflow"] = new
+                changed = True
+        if changed:
+            save_state(data)
 
 
 # --------------------------------------------------------------------------- #
@@ -191,9 +286,21 @@ class Handler(BaseHTTPRequestHandler):
                     return self._error(404, "not found")
                 with open(full, "r", encoding="utf-8") as f:
                     return self._send(200, f.read(), "text/plain; charset=utf-8")
+            if path == "/api/workflows":
+                return self._json(list_workflows())
+            if path == "/api/workflow":
+                full = workflow_path(self._query().get("name", [""])[0])
+                if not os.path.isfile(full):
+                    return self._error(404, "not found")
+                with open(full, "r", encoding="utf-8") as f:
+                    return self._send(200, f.read(), "text/plain; charset=utf-8")
+            if path == "/api/state":
+                return self._json(load_state())
             if path.startswith("/content/"):
                 return self._serve_file(safe_join(path[len("/content/"):]))
             return self._error(404, "not found")
+        except ValueError as e:
+            return self._error(400, str(e))
         except PermissionError as e:
             return self._error(403, str(e))
         except Exception as e:  # pragma: no cover
@@ -202,8 +309,9 @@ class Handler(BaseHTTPRequestHandler):
     do_HEAD = do_GET
 
     def do_PUT(self):
+        path = urlparse(self.path).path
         try:
-            if urlparse(self.path).path == "/api/doc":
+            if path == "/api/doc":
                 rel = self._query().get("path", [""])[0]
                 full = safe_join(rel)
                 if not full.lower().endswith(".md"):
@@ -212,7 +320,23 @@ class Handler(BaseHTTPRequestHandler):
                 with open(full, "w", encoding="utf-8") as f:
                     f.write(self._body().decode("utf-8"))
                 return self._json({"ok": True})
+            if path == "/api/workflow":
+                full = workflow_path(self._query().get("name", [""])[0])
+                os.makedirs(os.path.dirname(full), exist_ok=True)
+                with open(full, "w", encoding="utf-8") as f:
+                    f.write(self._body().decode("utf-8"))
+                return self._json({"ok": True,
+                                   "name": os.path.basename(full)[:-4]})
+            if path == "/api/state":
+                full = safe_join(self._query().get("path", [""])[0])
+                key = os.path.relpath(full, CONTENT).replace(os.sep, "/")
+                data = json.loads(self._body() or b"{}")
+                wf = (data.get("workflow") or "").strip()
+                st = (data.get("state") or "").strip()
+                return self._json({"ok": True, "state": set_doc_state(key, wf, st)})
             return self._error(404, "not found")
+        except ValueError as e:
+            return self._error(400, str(e))
         except PermissionError as e:
             return self._error(403, str(e))
         except Exception as e:  # pragma: no cover
@@ -251,8 +375,22 @@ class Handler(BaseHTTPRequestHandler):
                 dst = safe_join(os.path.join(os.path.dirname(
                     os.path.relpath(src, CONTENT)), newname).replace(os.sep, "/"))
                 os.rename(src, dst)
-                return self._json({"ok": True, "path":
-                                   os.path.relpath(dst, CONTENT).replace(os.sep, "/")})
+                oldkey = os.path.relpath(src, CONTENT).replace(os.sep, "/")
+                newkey = os.path.relpath(dst, CONTENT).replace(os.sep, "/")
+                rekey_state(oldkey, newkey)
+                return self._json({"ok": True, "path": newkey})
+
+            if path == "/api/workflow-rename":
+                data = json.loads(self._body() or b"{}")
+                old = clean_name(data.get("name"))
+                new = clean_name(data.get("newname"))
+                src = workflow_path(old)
+                if not os.path.isfile(src):
+                    return self._error(404, "not found")
+                dst = workflow_path(new)
+                os.rename(src, dst)
+                rename_workflow_refs(old, new)
+                return self._json({"ok": True, "name": new})
 
             if path == "/api/upload":
                 fn = unique_asset_name(self.headers.get("X-Filename", "file"))
@@ -270,17 +408,28 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(500, str(e))
 
     def do_DELETE(self):
+        path = urlparse(self.path).path
         try:
-            if urlparse(self.path).path == "/api/doc":
+            if path == "/api/doc":
                 full = safe_join(self._query().get("path", [""])[0])
+                key = os.path.relpath(full, CONTENT).replace(os.sep, "/")
                 if os.path.isdir(full):
                     shutil.rmtree(full)
                 elif os.path.isfile(full):
                     os.remove(full)
                 else:
                     return self._error(404, "not found")
+                drop_state(key)
+                return self._json({"ok": True})
+            if path == "/api/workflow":
+                full = workflow_path(self._query().get("name", [""])[0])
+                if not os.path.isfile(full):
+                    return self._error(404, "not found")
+                os.remove(full)
                 return self._json({"ok": True})
             return self._error(404, "not found")
+        except ValueError as e:
+            return self._error(400, str(e))
         except PermissionError as e:
             return self._error(403, str(e))
         except Exception as e:  # pragma: no cover
@@ -403,12 +552,51 @@ HTML = r"""<!doctype html>
   .rec-dot{display:inline-block;width:9px;height:9px;border-radius:50%;
     background:#fff;margin-right:6px;animation:blink 1s steps(2) infinite}
   @keyframes blink{50%{opacity:.2}}
+  /* workflows */
+  header #openWf{color:var(--accent);text-decoration:none;font-size:12px;
+    border:1px solid var(--line);border-radius:6px;padding:4px 8px}
+  header #openWf:hover{border-color:var(--accent);background:var(--panel2)}
+  #work[hidden],#wfview[hidden]{display:none}
+  #wfview{flex:1;display:flex;flex-direction:column;min-width:0}
+  #wftoolbar{display:flex;align-items:center;gap:6px;padding:6px 10px;
+    background:var(--panel);border-bottom:1px solid var(--line)}
+  #wftoolbar select{min-width:140px}
+  #wfpanes{flex:1;display:flex;min-height:0}
+  #wfEditorWrap{flex:1;display:flex;min-width:0}
+  #wfEditor{flex:1;resize:none;border:0;outline:0;padding:16px;background:var(--bg);
+    color:var(--fg);font:13px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace}
+  #wfSummary{flex:1;overflow:auto;padding:16px 20px;
+    border-left:1px solid var(--line);background:#20242c}
+  #wfSummary h3{margin:.7em 0 .3em;font-size:13px}
+  #wfSummary h3:first-child{margin-top:0}
+  #wfSummary h3.err{color:var(--danger)}
+  #wfSummary .ct{color:var(--muted);font-weight:400}
+  #wfSummary ul{margin:.2em 0 .8em;padding-left:18px}
+  #wfSummary li{margin:.25em 0}
+  #wfSummary .ev{color:var(--muted)}
+  #wfSummary .empty{margin:0;color:var(--muted);text-align:left;padding:0}
+  #wfSummary .tag{font-size:11px;border-radius:4px;padding:0 5px;margin-left:5px}
+  #wfSummary .tag.start{background:var(--accent);color:#0b1220}
+  #wfSummary .tag.term{background:var(--ok);color:#0b1220}
+  select{background:var(--panel2);color:var(--fg);border:1px solid var(--line);
+    border-radius:6px;padding:5px 8px;font-size:13px}
+  select:hover{border-color:var(--accent)}
+  #toolbar select{padding:4px 6px;font-size:12px;max-width:160px}
+  .wfcur{font-size:11px;padding:2px 9px;border-radius:10px;font-weight:600}
+  .wfcur.moving{background:var(--accent);color:#0b1220}
+  .wfcur.done{background:var(--ok);color:#0b1220}
+  .row .wf{font-size:10px;padding:0 6px;border-radius:8px;margin-left:4px;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:92px;flex:none}
+  .row .wf.moving{background:var(--accent);color:#0b1220}
+  .row .wf.done{background:var(--panel2);color:var(--ok);border:1px solid var(--line)}
+  .row.sel .wf.moving{background:#0b1220;color:var(--accent)}
 </style>
 </head>
 <body>
 <header>
   <h1>📚 social-learning</h1>
   <a href="#" id="about" title="Info, help &amp; Pandoc / Info, aiuto e Pandoc">ℹ Info</a>
+  <a href="#" id="openWf" title="Define and edit workflows / Definisci e modifica i flussi">🔀 Workflows</a>
   <span class="sp"></span>
   <button id="mEdit" title="Editor only">✎</button>
   <button id="mSplit" class="pri" title="Split">⬍</button>
@@ -551,6 +739,9 @@ lit parse book.pdf --format markdown -o book.md</code></pre>
   <section id="work">
     <div id="toolbar">
       <span id="docpath">No document selected</span>
+      <select id="wfAssign" title="Assign a workflow to this document" disabled></select>
+      <span id="wfCur" class="wfcur" hidden></span>
+      <select id="wfState" title="Advance to the next state" hidden></select>
       <button id="recAudio" title="Record audio">🎤</button>
       <button id="recVideo" title="Record video">🎥</button>
       <button id="save" class="pri">Save</button>
@@ -559,6 +750,22 @@ lit parse book.pdf --format markdown -o book.md</code></pre>
       <div id="editor"><textarea id="ta" spellcheck="false"
         placeholder="Select or create a document…"></textarea></div>
       <div id="preview"></div>
+    </div>
+  </section>
+  <section id="wfview" hidden>
+    <div id="wftoolbar">
+      <select id="wfPick" title="Choose a workflow"></select>
+      <button id="wfNew">+ New</button>
+      <button id="wfRename">Rename</button>
+      <button id="wfDelete">Delete</button>
+      <span class="sp" style="flex:1"></span>
+      <span class="status" id="wfStatus"></span>
+      <button id="wfClose">✕ Close</button>
+    </div>
+    <div id="wfpanes">
+      <div id="wfEditorWrap"><textarea id="wfEditor" spellcheck="false"
+        placeholder='Define a workflow in DOT, e.g.&#10;&#10;digraph {&#10;  Draft -> Submitted [label="submit"];&#10;  Submitted -> Approved [label="approve"];&#10;}'></textarea></div>
+      <div id="wfSummary"></div>
     </div>
   </section>
 </main>
@@ -579,16 +786,89 @@ const api = {
                 {method:"DELETE"}).then(r => r.json()),
   upload:    (blob, name) => fetch("/api/upload", {method:"POST",
                 headers:{"X-Filename":name}, body:blob}).then(r => r.json()),
+  workflows: () => fetch("/api/workflows").then(r => r.json()),
+  workflow:  n => fetch("/api/workflow?name=" + encodeURIComponent(n)).then(r => r.text()),
+  saveWf:    (n, t) => fetch("/api/workflow?name=" + encodeURIComponent(n),
+                {method:"PUT", body:t}).then(r => r.json()),
+  renameWf:  (n, nn) => fetch("/api/workflow-rename", {method:"POST",
+                body:JSON.stringify({name:n, newname:nn})}).then(r => r.json()),
+  delWf:     n => fetch("/api/workflow?name=" + encodeURIComponent(n),
+                {method:"DELETE"}).then(r => r.json()),
+  states:    () => fetch("/api/state").then(r => r.json()),
+  setState:  (p, o) => fetch("/api/state?path=" + encodeURIComponent(p),
+                {method:"PUT", body:JSON.stringify(o)}).then(r => r.json()),
 };
 
 let state = {path:null, dirty:false, open:{}};
 const ta = $("#ta"), preview = $("#preview"), status = $("#status");
 
+/* ------------------------------------------------------------ workflows --- */
+let stateMap = {};        // docpath -> {workflow, state}
+let wfNames = [];         // available workflow names
+const wfCache = {};       // name -> parsed workflow (from parseDot)
+
+/* Parse a small subset of Graphviz DOT into states + labelled transitions.
+   Deliberately lenient: we own both ends, so we tolerate messy input rather
+   than reject it. Returns {states, transitions:[{from,to,event}], errors}. */
+function parseDot(src){
+  const res = {states:[], transitions:[], errors:[]};
+  const seen = new Set();
+  const add = s => { if(s && !seen.has(s)){ seen.add(s); res.states.push(s); } };
+  const unq = s => s.replace(/^"|"$/g, "");
+  let t = (src || "")
+    .replace(/\/\*[\s\S]*?\*\//g, " ")        // /* block */ comments
+    .replace(/(^|[^:])\/\/[^\n]*/g, "$1")     // // line comments (keep http://)
+    .replace(/(^|\s)#[^\n]*/g, "$1");         // # line comments
+  const bm = t.match(/\{([\s\S]*)\}/);        // digraph body, if wrapped
+  const body = bm ? bm[1] : t;
+  const ID = '("[^"]*"|[A-Za-z_][A-Za-z0-9_.]*)';
+  const nodeRe = new RegExp('^' + ID + '\\s*(\\[|$)');
+  for(const raw of body.split(/[;\n]+/)){
+    const s = raw.trim();
+    if(!s) continue;
+    if(/^(strict|digraph|graph|subgraph|rankdir|node|edge|label|bgcolor|size|ratio|splines|nodesep|ranksep)\b/i.test(s)
+       && !/->/.test(s)) continue;            // graph-level attrs / defaults
+    if(/->/.test(s)){                          // edge, possibly chained
+      const am = s.match(/\[([^\]]*)\]\s*$/);
+      const attrs = am ? am[1] : "";
+      const core = am ? s.slice(0, am.index) : s;
+      const lm = attrs.match(/label\s*=\s*("([^"]*)"|[A-Za-z0-9_]+)/i);
+      const event = lm ? (lm[2] !== undefined ? lm[2] : lm[1]) : "";
+      const parts = core.split("->").map(p => unq(p.trim())).filter(Boolean);
+      parts.forEach(add);
+      for(let i = 0; i + 1 < parts.length; i++)
+        res.transitions.push({from:parts[i], to:parts[i+1], event});
+      continue;
+    }
+    const nm = s.match(nodeRe);                // node declaration
+    if(nm){ add(unq(nm[1])); continue; }
+    res.errors.push(s);
+  }
+  return res;
+}
+function wfStart(wf){
+  const incoming = new Set(wf.transitions.map(t => t.to));
+  return wf.states.find(s => !incoming.has(s)) || wf.states[0] || "";
+}
+function isTerminal(wf, s){ return !wf.transitions.some(t => t.from === s); }
+function allowedFrom(wf, s){ return wf.transitions.filter(t => t.from === s); }
+async function getWf(name){
+  if(!name) return null;
+  if(!wfCache[name]) wfCache[name] = parseDot(await api.workflow(name));
+  return wfCache[name];
+}
+
 /* ---------------------------------------------------------------- tree --- */
 async function loadTree(){
   const data = await api.tree();
+  stateMap = await api.states();
+  // preload the workflows referenced by state so markers render synchronously
+  const needed = new Set(Object.values(stateMap)
+    .map(v => v && v.workflow).filter(Boolean));
+  await Promise.all([...needed].map(getWf));
   const el = $("#tree"); el.innerHTML = "";
   el.appendChild(renderNodes(data, ""));
+  refreshDocWorkflowUI();
 }
 function renderNodes(nodes, parent){
   const frag = document.createDocumentFragment();
@@ -601,6 +881,19 @@ function renderNodes(nodes, parent){
     const nm = document.createElement("span"); nm.className = "nm";
     ic.textContent = isDir ? "📁" : "📄"; nm.textContent = n.name;
     row.append(tw, ic, nm);
+    if(!isDir){
+      const info = stateMap[n.path];
+      if(info && info.workflow){
+        const wf = wfCache[info.workflow];
+        const term = wf && isTerminal(wf, info.state);
+        const chip = document.createElement("span");
+        chip.className = "wf " + (term ? "done" : "moving");
+        chip.textContent = (term ? "✓ " : "") + info.state;
+        chip.title = info.workflow + " · " + info.state +
+          (term ? " (done)" : " (in progress)");
+        row.append(chip);
+      }
+    }
     const act = document.createElement("span"); act.className = "act";
     const ren = document.createElement("span"); ren.textContent = "✎"; ren.title="Rename";
     const del = document.createElement("span"); del.textContent = "🗑"; del.title="Delete";
@@ -672,6 +965,52 @@ ta.addEventListener("input", () => {
   state.dirty = true; render(); markSaved();
   clearTimeout(saveTimer); saveTimer=setTimeout(save, 1200);
 });
+
+/* ------------------------------------------- document workflow / state --- */
+async function refreshDocWorkflowUI(){
+  const asg = $("#wfAssign"), stSel = $("#wfState"), cur = $("#wfCur");
+  asg.innerHTML = "";
+  asg.append(new Option("— no workflow —", ""));
+  for(const n of wfNames) asg.append(new Option(n, n));
+  if(!state.path){
+    asg.disabled = true; asg.value = ""; cur.hidden = true; stSel.hidden = true;
+    return;
+  }
+  asg.disabled = false;
+  const info = stateMap[state.path];
+  asg.value = info && info.workflow ? info.workflow : "";
+  if(info && info.workflow){
+    const wf = await getWf(info.workflow);
+    const term = isTerminal(wf, info.state);
+    cur.hidden = false; cur.textContent = info.state;
+    cur.className = "wfcur " + (term ? "done" : "moving");
+    const opts = allowedFrom(wf, info.state);
+    stSel.innerHTML = "";
+    stSel.append(new Option(opts.length ? "Advance…" : "✓ terminal", ""));
+    for(const t of opts)
+      stSel.append(new Option((t.event ? t.event + " → " : "→ ") + t.to, t.to));
+    stSel.disabled = !opts.length; stSel.hidden = false;
+  } else {
+    cur.hidden = true; stSel.hidden = true;
+  }
+}
+$("#wfAssign").onchange = async () => {
+  if(!state.path) return;
+  const name = $("#wfAssign").value;
+  let st = "";
+  if(name){ const wf = await getWf(name); st = wfStart(wf); }
+  const r = await api.setState(state.path, {workflow:name, state:st});
+  if(r.error) return alert(r.error);
+  await loadTree();
+};
+$("#wfState").onchange = async () => {
+  if(!state.path) return;
+  const to = $("#wfState").value; if(!to) return;
+  const info = stateMap[state.path]; if(!info) return;
+  const r = await api.setState(state.path, {workflow:info.workflow, state:to});
+  if(r.error) return alert(r.error);
+  await loadTree();
+};
 
 /* --------------------------------------------------------- new / toolbar --- */
 function selectedDir(){
@@ -873,8 +1212,106 @@ function mdToHtml(src){
   return out.join("\n");
 }
 
+/* ------------------------------------------- workflow definition editor --- */
+let curWf = null;                 // name of the workflow being edited
+let wfSaveTimer = null;
+async function loadWorkflows(){ wfNames = await api.workflows(); }
+function populateWfPick(){
+  const p = $("#wfPick"); p.innerHTML = "";
+  if(!wfNames.length){ p.append(new Option("— no workflows —", "")); }
+  for(const n of wfNames) p.append(new Option(n, n));
+  if(curWf) p.value = curWf;
+}
+async function selectWf(name){
+  curWf = name || null;
+  $("#wfEditor").value = name ? await api.workflow(name) : "";
+  $("#wfEditor").disabled = !name;
+  $("#wfPick").value = name || "";
+  $("#wfStatus").textContent = "";
+  renderWfSummary();
+}
+function renderWfSummary(){
+  const el = $("#wfSummary");
+  if(!curWf){
+    el.innerHTML = '<div class="empty">No workflow selected. Click ' +
+      '<b>+ New</b> to define one.</div>';
+    return;
+  }
+  const wf = parseDot($("#wfEditor").value);
+  wfCache[curWf] = wf;                        // keep the cache fresh while editing
+  const start = wfStart(wf);
+  let h = '<h3>States <span class="ct">(' + wf.states.length + ')</span></h3><ul>';
+  if(!wf.states.length) h += '<li class="ct">none yet</li>';
+  for(const s of wf.states){
+    let tags = "";
+    if(s === start) tags += '<span class="tag start">start</span>';
+    if(isTerminal(wf, s)) tags += '<span class="tag term">terminal</span>';
+    h += "<li>" + escHtml(s) + tags + "</li>";
+  }
+  h += '</ul><h3>Transitions <span class="ct">(' + wf.transitions.length +
+       ')</span></h3><ul>';
+  if(!wf.transitions.length) h += '<li class="ct">none yet</li>';
+  for(const t of wf.transitions)
+    h += "<li>" + escHtml(t.from) + " → " + escHtml(t.to) +
+      (t.event ? ' <span class="ev">on "' + escHtml(t.event) + '"</span>' : "") + "</li>";
+  h += "</ul>";
+  if(wf.errors.length)
+    h += '<h3 class="err">Unparsed (' + wf.errors.length + ")</h3><ul>" +
+      wf.errors.map(e => "<li>" + escHtml(e) + "</li>").join("") + "</ul>";
+  el.innerHTML = h;
+}
+async function saveWf(){
+  if(!curWf) return;
+  const r = await api.saveWf(curWf, $("#wfEditor").value);
+  $("#wfStatus").textContent = r && r.ok ? "saved" : "save failed";
+}
+$("#wfEditor").addEventListener("input", () => {
+  renderWfSummary(); $("#wfStatus").textContent = "unsaved…";
+  clearTimeout(wfSaveTimer); wfSaveTimer = setTimeout(saveWf, 1000);
+});
+function openWorkflows(){
+  $("#wfview").hidden = false; $("#work").hidden = true;
+  populateWfPick();
+  if(wfNames.length){ if(!curWf || !wfNames.includes(curWf)) curWf = wfNames[0];
+    selectWf(curWf); } else selectWf(null);
+}
+function closeWorkflows(){ $("#wfview").hidden = true; $("#work").hidden = false; }
+$("#openWf").onclick = e => { e.preventDefault(); openWorkflows(); };
+$("#wfClose").onclick = closeWorkflows;
+$("#wfPick").onchange = () => { if($("#wfPick").value) selectWf($("#wfPick").value); };
+$("#wfNew").onclick = async () => {
+  const name = prompt("New workflow name:"); if(!name) return;
+  const tmpl = 'digraph {\n  Draft -> Submitted   [label="submit"];\n' +
+    '  Submitted -> Approved [label="approve"];\n' +
+    '  Submitted -> Draft    [label="revise"];\n}\n';
+  const r = await api.saveWf(name, tmpl);
+  if(r.error) return alert(r.error);
+  await loadWorkflows(); curWf = r.name; populateWfPick(); selectWf(r.name);
+};
+$("#wfRename").onclick = async () => {
+  if(!curWf) return;
+  const nn = prompt("Rename workflow to:", curWf); if(!nn || nn === curWf) return;
+  const r = await api.renameWf(curWf, nn);
+  if(r.error) return alert(r.error);
+  delete wfCache[curWf]; curWf = r.name;
+  await loadWorkflows(); await loadTree(); populateWfPick(); selectWf(r.name);
+};
+$("#wfDelete").onclick = async () => {
+  if(!curWf) return;
+  if(!confirm('Delete workflow "' + curWf + '"?')) return;
+  const r = await api.delWf(curWf);
+  if(r.error) return alert(r.error);
+  delete wfCache[curWf]; curWf = null;
+  await loadWorkflows(); populateWfPick();
+  selectWf(wfNames[0] || null);
+};
+
 /* --------------------------------------------------------------- boot ----- */
-loadTree(); render(); markSaved();
+(async function boot(){
+  await loadWorkflows();
+  await loadTree();
+  render(); markSaved();
+})();
 </script>
 </body>
 </html>
@@ -883,7 +1320,7 @@ loadTree(); render(); markSaved();
 
 # --------------------------------------------------------------------------- #
 def main():
-    global CONTENT, ASSETS
+    global CONTENT, ASSETS, WORKFLOWS, STATE_FILE
     ap = argparse.ArgumentParser(description="social-learning document manager")
     ap.add_argument("--host", default="127.0.0.1",
                     help="IP address to bind (default 127.0.0.1)")
@@ -898,6 +1335,8 @@ def main():
 
     CONTENT = os.path.realpath(args.dir)
     ASSETS = os.path.join(CONTENT, "_assets")
+    WORKFLOWS = os.path.join(CONTENT, "_workflows")
+    STATE_FILE = os.path.join(WORKFLOWS, "_state.json")
     url = f"http://{args.host}:{args.port}/"
 
     print("social-learning")
