@@ -2,10 +2,12 @@
 """
 social-learning — a compact, single-file document manager.
 
-Run locally:   python3 app.py                    (opens http://127.0.0.1:8000)
-               python3 app.py --host 0.0.0.0 --port 9000
-               python3 app.py --dir ./notes      (serve a different folder)
-               python3 app.py --noprompt --no-open   (for scripts / CI)
+Run locally:   python3 social-learning-server.py         (http://127.0.0.1:8000)
+               python3 social-learning-server.py --host 0.0.0.0 --port 9000
+               python3 social-learning-server.py --dir ./notes  (another folder)
+               python3 social-learning-server.py --token SECRET (gate writes)
+               python3 social-learning-server.py --noprompt --no-open  (CI)
+               python3 social-learning-server.py --selftest    (concurrency test)
 
 Content lives as plain files in this repo, so it is git-trackable and
 contributors can just push new documents:
@@ -13,18 +15,35 @@ contributors can just push new documents:
     content/                 hierarchy of documents (folders = tree)
       <folder>/<doc>.md      one markdown file per document
       _assets/               pasted images/files and audio/video recordings
+      _versions/             previous text of an overwritten/deleted document
+      _workflows/            workflow definitions and per-document state
 
 The whole application (server + HTML + CSS + JS) is this one file, using only
-the Python standard library. No login yet (a server deployment with auth is a
-future step); everything runs against the local filesystem.
+the Python standard library.
+
+Several people can use one server at once. What that guarantees, precisely:
+no silent data loss (writes are atomic, and a save based on a version somebody
+else has replaced is refused with 409 rather than clobbering theirs), and
+awareness within seconds (a change feed refreshes idle editors and the tree,
+and shows who else is in a document). It is NOT simultaneous typing in one
+paragraph — see CLAUDE.md for why that is the wrong fit for this data model.
+
+There is still no login. --token gates writes behind a shared secret, which
+means "whoever has the link" and not identity: the name in the header box is
+self-declared and forgeable. Real per-user auth is the next step.
 """
 
 import argparse
+import collections
+import difflib
+import hashlib
+import hmac
 import json
 import mimetypes
 import os
 import re
 import shutil
+import tempfile
 import threading
 import time
 import webbrowser
@@ -37,9 +56,23 @@ CONTENT = os.path.realpath("content")
 ASSETS = os.path.join(CONTENT, "_assets")
 WORKFLOWS = os.path.join(CONTENT, "_workflows")
 STATE_FILE = os.path.join(WORKFLOWS, "_state.json")
+VERSIONS = os.path.join(CONTENT, "_versions")
 
-# _state.json is read-modify-written from several worker threads.
-STATE_LOCK = threading.Lock()
+# _state.json is read-modify-written from several worker threads. This is an
+# RLock, not a Lock: load_state()/save_state() take it themselves, and they are
+# also called from inside the `with STATE_LOCK` blocks of the mutators below.
+STATE_LOCK = threading.RLock()
+
+# Serializes the read-hash-compare-write sequence in PUT /api/doc. Without it
+# two requests can both read the same ETag, both pass If-Match, and both write.
+# One global lock is deliberate: documents are small and are held for a few ms,
+# which is far cheaper than a per-path lock registry and its cleanup problem.
+DOC_WRITE_LOCK = threading.Lock()
+
+# Optional shared secret for writes (--token). Not authentication: it only
+# means "whoever has the link", so that reaching the port is not enough to
+# delete someone's content. Real per-user auth is still a separate step.
+WRITE_TOKEN = ""
 
 mimetypes.add_type("text/markdown", ".md")
 mimetypes.add_type("video/webm", ".webm")
@@ -63,6 +96,81 @@ def safe_join(rel):
     return full
 
 
+def atomic_write(full, data):
+    """Write bytes to `full` so readers never observe a partial file.
+
+    Writes a temp file in the *same* directory (os.replace is only atomic
+    within one filesystem), fsyncs it, then renames it over the target. The
+    temp name starts with a dot so build_tree hides it if anything goes wrong.
+    Raises on failure, so the handler returns 500 and the client can say "save
+    failed" instead of silently losing the write.
+    """
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    d = os.path.dirname(full)
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".sl-tmp-", suffix=".part", dir=d)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        # On Windows os.replace raises PermissionError while another process
+        # (editor, indexer, antivirus) holds the destination open; retry briefly.
+        for attempt in range(3):
+            try:
+                os.replace(tmp, full)
+                return
+            except PermissionError:
+                if attempt == 2:
+                    raise
+                time.sleep(0.05)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def name_taken(src, dst):
+    """True if renaming src->dst would clobber a different existing entry.
+
+    The samefile clause is required, not defensive: on case-insensitive
+    filesystems (macOS, Windows) renaming Foo.md -> foo.md is a legitimate
+    case-only rename where dst already "exists" as the very same inode.
+    """
+    if not os.path.exists(dst):
+        return False
+    try:
+        return not os.path.samefile(src, dst)
+    except OSError:
+        return True
+
+
+def doc_etag(data):
+    """Version token for a document: a hash of its exact bytes.
+
+    A content hash (rather than mtime or a stored counter) is what makes
+    conflict detection survive `git pull`, `git checkout`, an external editor,
+    a server restart, or a second server on the same folder — all normal here,
+    and all invisible to a counter.
+    """
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    return 'W/"%d-%s"' % (
+        len(data), hashlib.blake2b(data, digest_size=8).hexdigest())
+
+
+def read_bytes(full):
+    """Current bytes of a file, or b"" if it does not exist yet."""
+    try:
+        with open(full, "rb") as f:
+            return f.read()
+    except (FileNotFoundError, IsADirectoryError):
+        return b""
+
+
 def build_tree(path):
     """Return the document hierarchy as nested dicts, sorted dirs-first."""
     entries = []
@@ -71,7 +179,7 @@ def build_tree(path):
     except FileNotFoundError:
         return entries
     for name in names:
-        if name.startswith(".") or name in ("_assets", "_workflows"):
+        if name.startswith(".") or name in ("_assets", "_workflows", "_versions"):
             continue
         full = os.path.join(path, name)
         rel = os.path.relpath(full, CONTENT).replace(os.sep, "/")
@@ -143,23 +251,81 @@ def list_workflows():
 
 
 def load_state():
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
+    """Read _state.json. Missing is empty; corrupt is an error, never empty.
+
+    Treating a corrupt file as {} would be catastrophic: the next mutator would
+    write {} plus its own single entry, discarding every document's workflow and
+    history. This file is git-tracked, so a bad merge makes that a real path.
+    """
+    with STATE_LOCK:
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return {}
+        except ValueError:
+            aside = os.path.join(
+                WORKFLOWS, "_state.corrupt-%s.json" % time.strftime("%Y%m%d-%H%M%S"))
+            try:
+                os.replace(STATE_FILE, aside)
+            except OSError:
+                pass
+            print("!! %s was not valid JSON; moved aside to %s"
+                  % (STATE_FILE, aside))
+            raise RuntimeError("document state file was corrupt; moved aside "
+                               "to " + os.path.basename(aside))
         return data if isinstance(data, dict) else {}
-    except (FileNotFoundError, ValueError):
-        return {}
 
 
 def save_state(data):
-    os.makedirs(WORKFLOWS, exist_ok=True)
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-        f.write("\n")
+    with STATE_LOCK:
+        atomic_write(STATE_FILE, json.dumps(data, indent=2,
+                                            ensure_ascii=False) + "\n")
 
 
 def now_stamp():
     return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+
+
+# --------------------------------------------------------------------------- #
+# Version snapshots
+#
+# Before a document's bytes are replaced (or the file deleted) the previous
+# content is kept under _versions/<doc path>/<stamp>-<user>.md. These are inert
+# files, hidden from the tree: git versions them if a contributor commits, and
+# nothing here ever commits on its own. They are what makes the "overwrite"
+# choice in a save conflict a decision rather than a data loss.
+# --------------------------------------------------------------------------- #
+SNAP_COALESCE = 120        # seconds — don't re-snapshot this soon, same author
+SNAP_KEEP = 20             # newest snapshots kept per document
+
+
+def keep_version(key, data, by):
+    """Preserve `data` (the bytes about to be replaced) for document `key`."""
+    if not data:
+        return                                    # nothing to preserve
+    d = os.path.join(VERSIONS, *key.split("/"))
+    who = re.sub(r"[^A-Za-z0-9._-]", "_", by or "unknown")[:40] or "unknown"
+    try:
+        existing = sorted(os.listdir(d))
+    except FileNotFoundError:
+        existing = []
+    # A 1.2 s autosave loop would otherwise produce thousands of files an hour,
+    # so coalesce a burst by one author into its first snapshot.
+    if existing and existing[-1].endswith("-%s.md" % who):
+        try:
+            if time.time() - os.path.getmtime(
+                    os.path.join(d, existing[-1])) < SNAP_COALESCE:
+                return
+        except OSError:
+            pass
+    atomic_write(os.path.join(
+        d, "%s-%s.md" % (time.strftime("%Y%m%d-%H%M%S"), who)), data)
+    for stale in sorted(os.listdir(d))[:-SNAP_KEEP]:
+        try:
+            os.unlink(os.path.join(d, stale))
+        except OSError:
+            pass
 
 
 def record_created(key, by):
@@ -240,8 +406,98 @@ def rename_workflow_refs(old, new):
 
 
 # --------------------------------------------------------------------------- #
+# Change feed and presence
+#
+# Every mutation appends to a small in-memory ring buffer; clients poll
+# /api/changes?since=<seq> every few seconds and react. Polling rather than SSE
+# is deliberate: this handler speaks HTTP/1.0 (connection-close), so a held-open
+# EventSource would permanently occupy one of the browser's ~6 connections per
+# origin while _serve_file streams media on the others — a handful of tabs would
+# deadlock the app, and the stdlib cannot speak HTTP/2 to fix it. Presence rides
+# along in the same request, which an EventSource could not carry at all (it can
+# set neither headers nor a body).
+#
+# Both structures are memory-only. Presence especially must never be persisted:
+# it is ephemeral, it would be a write storm on a git-tracked file, and a crash
+# would leave permanent ghost editors.
+# --------------------------------------------------------------------------- #
+CHANGE_LOCK = threading.Lock()
+CHANGE_SEQ = 0
+CHANGE_LOG = collections.deque(maxlen=200)
+PRESENCE = {}                 # path -> {client_id: {"user", "last", "editing"}}
+PRESENCE_TTL = 30             # seconds without a heartbeat before a peer expires
+
+
+def publish(kind, path, by, origin=""):
+    """Record a change. `origin` is the client id that caused it.
+
+    Clients ignore events carrying their own origin; without that, a client's
+    own 1.2 s autosave would echo back and reload the textarea under its cursor.
+    """
+    global CHANGE_SEQ
+    with CHANGE_LOCK:
+        CHANGE_SEQ += 1
+        CHANGE_LOG.append({"seq": CHANGE_SEQ, "kind": kind, "path": path,
+                           "by": by, "origin": origin, "at": now_stamp()})
+
+
+def changes_since(since):
+    """Events after `since`, or a resync request if we cannot serve that far."""
+    with CHANGE_LOCK:
+        oldest = CHANGE_LOG[0]["seq"] if CHANGE_LOG else CHANGE_SEQ + 1
+        # since > CHANGE_SEQ means the server restarted under this client.
+        if since > CHANGE_SEQ or (since and since + 1 < oldest):
+            return {"seq": CHANGE_SEQ, "resync": True, "events": []}
+        return {"seq": CHANGE_SEQ,
+                "events": [e for e in CHANGE_LOG if e["seq"] > since]}
+
+
+def last_writer(path):
+    """Who last saved this document, from the change log.
+
+    Read from the log rather than stored per document on purpose: recording it
+    in _state.json would rewrite a git-tracked file on every 1.2 s autosave. The
+    cost is that a server restart forgets the name, so the conflict notice just
+    says "someone" — acceptable for a message, unacceptable as a write storm.
+    """
+    with CHANGE_LOCK:
+        for e in reversed(CHANGE_LOG):
+            if e["kind"] == "doc" and e["path"] == path:
+                return e
+    return {}
+
+
+def touch_presence(path, client, user, editing):
+    """Heartbeat one client's location, expire stale peers, return the roster."""
+    now = time.time()
+    with CHANGE_LOCK:
+        if client and path:
+            PRESENCE.setdefault(path, {})[client] = {
+                "user": user, "last": now, "editing": bool(editing)}
+        for p in list(PRESENCE):                  # prune on touch, no reaper
+            for c in [c for c, v in PRESENCE[p].items()
+                      if now - v["last"] > PRESENCE_TTL]:
+                PRESENCE[p].pop(c, None)
+            if not PRESENCE[p]:
+                PRESENCE.pop(p, None)
+        return {p: [{"user": v["user"] or "someone", "editing": v["editing"]}
+                    for c, v in peers.items() if c != client]
+                for p, peers in PRESENCE.items()}
+
+
+# --------------------------------------------------------------------------- #
 # HTTP handler
 # --------------------------------------------------------------------------- #
+class Server(ThreadingHTTPServer):
+    # Every response is connection-close (HTTP/1.0), so each request needs a
+    # fresh connection. With several people in the app — polling, autosaving,
+    # streaming media — bursts easily exceed the stdlib default of 5 pending
+    # connections, and the kernel answers the overflow with a TCP reset that
+    # surfaces as a failed save. 128 costs nothing and removes the cliff.
+    request_queue_size = 128
+    daemon_threads = True
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "social-learning/1.0"
 
@@ -261,8 +517,13 @@ class Handler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
-    def _json(self, obj, code=200):
-        self._send(code, json.dumps(obj), "application/json; charset=utf-8")
+    def _json(self, obj, code=200, extra=None):
+        # no-store on every JSON reply: an ETag on a heuristically cacheable
+        # response would let a fetch serve stale text paired with a stale ETag,
+        # which surfaces as phantom conflicts or a silent overwrite.
+        head = {"Cache-Control": "no-store"}
+        head.update(extra or {})
+        self._send(code, json.dumps(obj), "application/json; charset=utf-8", head)
 
     def _error(self, code, msg):
         self._json({"error": msg}, code)
@@ -277,6 +538,21 @@ class Handler(BaseHTTPRequestHandler):
     def _who(self):
         """Resolve the acting user: the X-User header, else the client IP."""
         return self.headers.get("X-User", "").strip() or self.client_address[0]
+
+    def _client(self):
+        """The calling tab's random id, used to filter out its own echoes."""
+        return self.headers.get("X-Client", "").strip()
+
+    def _token_ok(self):
+        """With --token set, writes must carry a matching X-Token header.
+
+        This is not identity — anyone holding the token is anyone — but it stops
+        a reachable port from being enough to overwrite or delete content.
+        """
+        if not WRITE_TOKEN:
+            return True
+        return hmac.compare_digest(
+            self.headers.get("X-Token", ""), WRITE_TOKEN)
 
     # -- static file serving (with Range support for media) --------------- #
     def _serve_file(self, full):
@@ -317,8 +593,23 @@ class Handler(BaseHTTPRequestHandler):
                 full = safe_join(self._query().get("path", [""])[0])
                 if not os.path.isfile(full):
                     return self._error(404, "not found")
-                with open(full, "r", encoding="utf-8") as f:
-                    return self._send(200, f.read(), "text/plain; charset=utf-8")
+                data = read_bytes(full)
+                # The ETag is the token the client echoes back as If-Match when
+                # it saves; no-store keeps a cached body/ETag pair out of play.
+                return self._send(200, data, "text/plain; charset=utf-8",
+                                  {"ETag": doc_etag(data),
+                                   "Cache-Control": "no-store"})
+            if path == "/api/changes":
+                q = self._query()
+                try:
+                    since = int(q.get("since", ["0"])[0])
+                except ValueError:
+                    since = 0
+                out = changes_since(since)
+                out["presence"] = touch_presence(
+                    q.get("path", [""])[0], q.get("client", [""])[0],
+                    q.get("user", [""])[0], q.get("editing", ["0"])[0] == "1")
+                return self._json(out)
             if path == "/api/workflows":
                 return self._json(list_workflows())
             if path == "/api/workflow":
@@ -330,7 +621,8 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/state":
                 return self._json(load_state())
             if path == "/api/whoami":
-                return self._json({"ip": self.client_address[0]})
+                return self._json({"ip": self.client_address[0],
+                                   "token": bool(WRITE_TOKEN)})
             if path.startswith("/content/"):
                 return self._serve_file(safe_join(path[len("/content/"):]))
             return self._error(404, "not found")
@@ -346,6 +638,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_PUT(self):
         path = urlparse(self.path).path
         try:
+            if not self._token_ok():
+                return self._error(403, "missing or wrong write token")
             if path == "/api/doc":
                 rel = self._query().get("path", [""])[0]
                 full = safe_join(rel)
@@ -353,17 +647,36 @@ class Handler(BaseHTTPRequestHandler):
                     return self._error(400, "only .md documents")
                 key = os.path.relpath(full, CONTENT).replace(os.sep, "/")
                 entry = load_state().get(key)
+                # Terminal-state check stays ahead of the conflict check, so a
+                # read-only document answers 403 rather than 409.
                 if entry and entry.get("terminal"):
                     return self._error(403, "document is read-only (terminal state)")
-                os.makedirs(os.path.dirname(full), exist_ok=True)
-                with open(full, "w", encoding="utf-8") as f:
-                    f.write(self._body().decode("utf-8"))
-                return self._json({"ok": True})
+                body = self._body()
+                who = self._who()
+                with DOC_WRITE_LOCK:
+                    cur = read_bytes(full)
+                    cur_tag = doc_etag(cur)
+                    want = self.headers.get("If-Match", "").strip()
+                    # A PUT with no If-Match still writes unconditionally: that
+                    # keeps curl and scripts working, and makes the "overwrite
+                    # anyway" path trivial. It also means a stale cached
+                    # front-end keeps the old last-writer-wins behaviour.
+                    if want and want != cur_tag:
+                        last = last_writer(key)
+                        return self._json({"error": "conflict", "etag": cur_tag,
+                                           "by": last.get("by", ""),
+                                           "at": last.get("at", "")}, 409)
+                    if cur != body:
+                        keep_version(key, cur, who)
+                    atomic_write(full, body)
+                publish("doc", key, who, self._client())
+                return self._json({"ok": True, "etag": doc_etag(body)},
+                                  extra={"ETag": doc_etag(body)})
             if path == "/api/workflow":
                 full = workflow_path(self._query().get("name", [""])[0])
-                os.makedirs(os.path.dirname(full), exist_ok=True)
-                with open(full, "w", encoding="utf-8") as f:
-                    f.write(self._body().decode("utf-8"))
+                atomic_write(full, self._body())
+                publish("workflow", os.path.basename(full)[:-4],
+                        self._who(), self._client())
                 return self._json({"ok": True,
                                    "name": os.path.basename(full)[:-4]})
             if path == "/api/state":
@@ -375,6 +688,7 @@ class Handler(BaseHTTPRequestHandler):
                 ev = (data.get("event") or "").strip()
                 term = bool(data.get("terminal"))
                 entry = set_doc_state(key, wf, st, ev, term, self._who())
+                publish("state", key, self._who(), self._client())
                 return self._json({"ok": True, "state": entry})
             return self._error(404, "not found")
         except ValueError as e:
@@ -387,6 +701,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         try:
+            if not self._token_ok():
+                return self._error(403, "missing or wrong write token")
             if path == "/api/create":
                 data = json.loads(self._body() or b"{}")
                 parent = data.get("parent", "")
@@ -396,15 +712,15 @@ class Handler(BaseHTTPRequestHandler):
                 if kind == "dir":
                     full = safe_join(rel)
                     os.makedirs(full, exist_ok=True)
-                    return self._json({"ok": True, "path":
-                                       os.path.relpath(full, CONTENT).replace(os.sep, "/")})
+                    key = os.path.relpath(full, CONTENT).replace(os.sep, "/")
+                    publish("create", key, self._who(), self._client())
+                    return self._json({"ok": True, "path": key})
                 full = safe_join(rel + ".md")
-                os.makedirs(os.path.dirname(full), exist_ok=True)
                 if not os.path.exists(full):
-                    with open(full, "w", encoding="utf-8") as f:
-                        f.write(f"# {name}\n\n")
+                    atomic_write(full, f"# {name}\n\n")
                 key = os.path.relpath(full, CONTENT).replace(os.sep, "/")
                 record_created(key, self._who())
+                publish("create", key, self._who(), self._client())
                 return self._json({"ok": True, "path": key})
 
             if path == "/api/rename":
@@ -417,10 +733,15 @@ class Handler(BaseHTTPRequestHandler):
                     newname += ".md"
                 dst = safe_join(os.path.join(os.path.dirname(
                     os.path.relpath(src, CONTENT)), newname).replace(os.sep, "/"))
+                if name_taken(src, dst):
+                    return self._error(
+                        409, "a file or folder with that name already exists")
                 os.rename(src, dst)
                 oldkey = os.path.relpath(src, CONTENT).replace(os.sep, "/")
                 newkey = os.path.relpath(dst, CONTENT).replace(os.sep, "/")
                 rekey_state(oldkey, newkey)
+                publish("rename", oldkey, self._who(), self._client())
+                publish("create", newkey, self._who(), self._client())
                 return self._json({"ok": True, "path": newkey})
 
             if path == "/api/workflow-rename":
@@ -431,18 +752,31 @@ class Handler(BaseHTTPRequestHandler):
                 if not os.path.isfile(src):
                     return self._error(404, "not found")
                 dst = workflow_path(new)
+                if name_taken(src, dst):
+                    return self._error(409, "a workflow with that name already exists")
                 os.rename(src, dst)
                 rename_workflow_refs(old, new)
+                publish("workflow", new, self._who(), self._client())
                 return self._json({"ok": True, "name": new})
 
             if path == "/api/upload":
                 # X-Filename is percent-encoded by the client (headers are latin-1)
                 fn = unique_asset_name(
                     unquote(self.headers.get("X-Filename", "file")))
-                dest = os.path.join(ASSETS, fn)
-                with open(dest, "wb") as f:
-                    f.write(self._body())
+                # Atomic: a dropped connection must not leave a truncated asset
+                # at a URL the client has already inserted into the markdown.
+                atomic_write(os.path.join(ASSETS, fn), self._body())
                 return self._json({"url": "/content/_assets/" + fn, "name": fn})
+
+            if path == "/api/diff":
+                # Unified diff of the on-disk document against the body (the
+                # editor's unsaved text), for the "show differences" view.
+                full = safe_join(self._query().get("path", [""])[0])
+                mine = self._body().decode("utf-8", "replace").splitlines()
+                theirs = read_bytes(full).decode("utf-8", "replace").splitlines()
+                return self._send(200, "\n".join(difflib.unified_diff(
+                    theirs, mine, "on the server", "in your editor", lineterm="")),
+                    "text/plain; charset=utf-8", {"Cache-Control": "no-store"})
 
             return self._error(404, "not found")
         except ValueError as e:
@@ -455,22 +789,28 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         path = urlparse(self.path).path
         try:
+            if not self._token_ok():
+                return self._error(403, "missing or wrong write token")
             if path == "/api/doc":
                 full = safe_join(self._query().get("path", [""])[0])
                 key = os.path.relpath(full, CONTENT).replace(os.sep, "/")
                 if os.path.isdir(full):
                     shutil.rmtree(full)
                 elif os.path.isfile(full):
+                    keep_version(key, read_bytes(full), self._who())
                     os.remove(full)
                 else:
                     return self._error(404, "not found")
                 drop_state(key)
+                publish("delete", key, self._who(), self._client())
                 return self._json({"ok": True})
             if path == "/api/workflow":
                 full = workflow_path(self._query().get("name", [""])[0])
                 if not os.path.isfile(full):
                     return self._error(404, "not found")
                 os.remove(full)
+                publish("workflow", os.path.basename(full)[:-4],
+                        self._who(), self._client())
                 return self._json({"ok": True})
             return self._error(404, "not found")
         except ValueError as e:
@@ -643,6 +983,29 @@ HTML = r"""<!doctype html>
   .row .wf.moving{background:var(--accent);color:#0b1220}
   .row .wf.done{background:var(--panel2);color:var(--ok);border:1px solid var(--line)}
   .row.sel .wf.moving{background:#0b1220;color:var(--accent)}
+  /* presence chips: who else has this document open */
+  .row .pr{font-size:10px;padding:0 5px;border-radius:8px;margin-left:4px;
+    white-space:nowrap;flex:none;background:var(--panel2);color:var(--muted);
+    border:1px solid var(--line)}
+  .row .pr.typing{background:#3a3320;color:#e5c07b;border-color:#5c4a20}
+  /* save-conflict bar: persistent and non-modal, because an alert() would
+     re-fire with every autosave tick */
+  #cbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:8px 10px;
+    background:#3a2a2c;border-bottom:1px solid var(--danger);font-size:12px}
+  #cbar[hidden]{display:none}
+  #cbar .msg{flex:1;min-width:200px;color:#f3c9cc}
+  #cbar button{font-size:12px;padding:4px 9px}
+  #pbar{display:flex;align-items:center;gap:8px;padding:5px 10px;
+    background:var(--panel2);border-bottom:1px solid var(--line);
+    font-size:12px;color:var(--muted)}
+  #pbar[hidden]{display:none}
+  /* diff view inside the metadata modal */
+  #meta pre.diff{background:var(--bg);border:1px solid var(--line);border-radius:8px;
+    padding:10px;overflow:auto;max-height:60vh;font:12px/1.5 ui-monospace,monospace;
+    white-space:pre}
+  #meta pre.diff .a{color:var(--ok)}
+  #meta pre.diff .d{color:var(--danger)}
+  #meta pre.diff .h{color:var(--accent)}
   /* header identity boxes */
   header .hbox{display:flex;align-items:center;gap:4px;font-size:12px;
     color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:2px 6px}
@@ -677,6 +1040,10 @@ HTML = r"""<!doctype html>
   <label class="hbox" title="Your name — used in document history / Il tuo nome — usato nella cronologia">👤
     <input id="userName" placeholder="username" spellcheck="false" autocomplete="off"></label>
   <span class="hbox ip" title="Your client IP address / Il tuo indirizzo IP">🌐 <span id="clientIp">…</span></span>
+  <label class="hbox" id="tokBox" hidden
+    title="Shared write token, required by this server / Token di scrittura condiviso, richiesto da questo server">🔑
+    <input id="writeToken" placeholder="token" spellcheck="false"
+      autocomplete="off" type="password"></label>
   <span class="sp"></span>
   <button id="mEdit" title="Editor only">✎</button>
   <button id="mSplit" class="pri" title="Split">⬍</button>
@@ -705,8 +1072,15 @@ HTML = r"""<!doctype html>
               clickable thumbnails.</li>
           <li><b>Audio &amp; video</b> — record clips from your camera/mic; they are
               saved and embedded as players.</li>
+          <li><b>Several people at once</b> — the sidebar refreshes on its own and
+              a 👥 badge shows who else has a document open. If two of you save
+              the same document, nobody's text is lost: the second save is
+              stopped and you choose to keep both, overwrite, reload or compare.
+              Replaced text is kept under <code>_versions/</code>.</li>
           <li><b>Git-friendly</b> — everything is saved as plain files under
-              <code>content/</code>, so you can commit and push your work.</li>
+              <code>content/</code>, so you can commit and push your work.
+              Changes made outside the app (a <code>git pull</code>, another
+              editor) are detected too, rather than silently overwritten.</li>
         </ul>
       </div>
       <div>
@@ -722,8 +1096,17 @@ HTML = r"""<!doctype html>
               di YouTube diventano miniature cliccabili.</li>
           <li><b>Audio e video</b> — registra clip da webcam/microfono; vengono
               salvate e incorporate come lettori multimediali.</li>
+          <li><b>In più persone insieme</b> — la barra laterale si aggiorna da sola
+              e un segno 👥 mostra chi altro ha aperto un documento. Se in due
+              salvate lo stesso documento non si perde il testo di nessuno: il
+              secondo salvataggio viene fermato e scegli tu se tenere entrambe le
+              versioni, sovrascrivere, ricaricare o confrontare. Il testo
+              sostituito resta in <code>_versions/</code>.</li>
           <li><b>Compatibile con Git</b> — tutto è salvato come file semplici in
-              <code>content/</code>, così puoi fare commit e push del tuo lavoro.</li>
+              <code>content/</code>, così puoi fare commit e push del tuo lavoro.
+              Anche le modifiche fatte fuori dall'app (un <code>git pull</code>,
+              un altro editor) vengono rilevate invece di essere sovrascritte in
+              silenzio.</li>
         </ul>
       </div>
     </div>
@@ -838,6 +1221,15 @@ lit parse book.pdf --format markdown -o book.md</code></pre>
       <button id="recVideo" title="Record video">🎥</button>
       <button id="save" class="pri">Save</button>
     </div>
+    <div id="pbar" hidden><span id="pbarMsg"></span></div>
+    <div id="cbar" hidden>
+      <span class="msg" id="cbarMsg"></span>
+      <button id="cCopy" class="pri"
+        title="Keep both versions: save yours as a new document">Save as a copy</button>
+      <button id="cOver" title="Replace the newer version with yours">Overwrite</button>
+      <button id="cReload" title="Throw away your changes and load theirs">Reload</button>
+      <button id="cDiff" title="Compare the two versions">Show differences</button>
+    </div>
     <div id="panes" class="split">
       <div id="editor"><textarea id="ta" spellcheck="false"
         placeholder="Select or create a document…"></textarea></div>
@@ -865,43 +1257,66 @@ lit parse book.pdf --format markdown -o book.md</code></pre>
 <script>
 "use strict";
 const $ = s => document.querySelector(s);
+/* Every write carries who did it (X-User), which tab did it (X-Client, so the
+   tab can ignore its own echoes from the change feed) and, if the server was
+   started with --token, the shared write token. */
+function wHead(extra){
+  const h = {"X-User":getUser(), "X-Client":CLIENT_ID};
+  const t = ($("#writeToken").value || "").trim();
+  if(t) h["X-Token"] = t;
+  return Object.assign(h, extra || {});
+}
 const api = {
   tree:      () => fetch("/api/tree").then(r => r.json()),
-  doc:       p => fetch("/api/doc?path=" + encodeURIComponent(p)).then(r => r.text()),
-  save:      (p, t) => fetch("/api/doc?path=" + encodeURIComponent(p),
-                {method:"PUT", body:t}).then(r => r.json()),
+  // returns {text, etag}: the etag is echoed back as If-Match when saving, so a
+  // save can tell "nobody touched this" from "someone did"
+  doc:       p => fetch("/api/doc?path=" + encodeURIComponent(p))
+                .then(r => r.text().then(text => ({text, etag:r.headers.get("ETag")}))),
+  save:      (p, t, etag) => fetch("/api/doc?path=" + encodeURIComponent(p),
+                {method:"PUT", headers:wHead(etag ? {"If-Match":etag} : null),
+                 body:t}).then(r => r.json().then(j => ({...j, status:r.status}))),
   create:    d => fetch("/api/create", {method:"POST",
-                headers:{"X-User":getUser()}, body:JSON.stringify(d)}).then(r => r.json()),
+                headers:wHead(), body:JSON.stringify(d)}).then(r => r.json()),
   rename:    d => fetch("/api/rename", {method:"POST",
-                body:JSON.stringify(d)}).then(r => r.json()),
+                headers:wHead(), body:JSON.stringify(d)}).then(r => r.json()),
   del:       p => fetch("/api/doc?path=" + encodeURIComponent(p),
-                {method:"DELETE"}).then(r => r.json()),
+                {method:"DELETE", headers:wHead()}).then(r => r.json()),
   // the filename travels in a header, so percent-encode it: HTTP headers are
   // latin-1 and fetch throws on accented/non-ASCII names otherwise
   upload:    (blob, name) => fetch("/api/upload", {method:"POST",
-                headers:{"X-Filename":encodeURIComponent(name)},
+                headers:wHead({"X-Filename":encodeURIComponent(name)}),
                 body:blob}).then(r => r.json()),
+  diff:      (p, mine) => fetch("/api/diff?path=" + encodeURIComponent(p),
+                {method:"POST", headers:wHead(), body:mine}).then(r => r.text()),
+  changes:   q => fetch("/api/changes?" + new URLSearchParams(q)).then(r => r.json()),
   workflows: () => fetch("/api/workflows").then(r => r.json()),
   workflow:  n => fetch("/api/workflow?name=" + encodeURIComponent(n)).then(r => r.text()),
   saveWf:    (n, t) => fetch("/api/workflow?name=" + encodeURIComponent(n),
-                {method:"PUT", body:t}).then(r => r.json()),
+                {method:"PUT", headers:wHead(), body:t}).then(r => r.json()),
   renameWf:  (n, nn) => fetch("/api/workflow-rename", {method:"POST",
+                headers:wHead(),
                 body:JSON.stringify({name:n, newname:nn})}).then(r => r.json()),
   delWf:     n => fetch("/api/workflow?name=" + encodeURIComponent(n),
-                {method:"DELETE"}).then(r => r.json()),
+                {method:"DELETE", headers:wHead()}).then(r => r.json()),
   states:    () => fetch("/api/state").then(r => r.json()),
   setState:  (p, o) => fetch("/api/state?path=" + encodeURIComponent(p),
-                {method:"PUT", headers:{"X-User":getUser()},
+                {method:"PUT", headers:wHead(),
                  body:JSON.stringify(o)}).then(r => r.json()),
   whoami:    () => fetch("/api/whoami").then(r => r.json()),
 };
 
 /* Identity: the username lives in the header box (persisted); the client IP
-   comes from the server. If no username is set, the server falls back to IP. */
+   comes from the server. If no username is set, the server falls back to IP.
+   CLIENT_ID identifies this *tab* — two tabs of one user are two clients, which
+   is what the change feed and presence need. */
+const CLIENT_ID = Math.random().toString(36).slice(2) +
+                  Math.random().toString(36).slice(2);
 function getUser(){ return ($("#userName").value || "").trim(); }
 
 // state.dir = the folder new documents/folders go into ("" = content root)
-let state = {path:null, dir:"", dirty:false, open:{}};
+// state.etag/baseText = the version this editor's text is based on
+let state = {path:null, dir:"", dirty:false, open:{},
+             etag:null, baseText:"", conflict:false, openSeq:0};
 const ta = $("#ta"), preview = $("#preview"), status = $("#status");
 
 /* ------------------------------------------------------------ workflows --- */
@@ -971,7 +1386,10 @@ async function loadTree(){
   const el = $("#tree"); el.innerHTML = "";
   el.appendChild(renderNodes(data, ""));
   $("#cwd").textContent = state.dir || "content/";
-  refreshDocWorkflowUI();
+  paintPresence();                    // the rebuild dropped the chips
+  // awaited: it settles docReadOnly, and callers switching documents must not
+  // run on the previous document's read-only flag
+  await refreshDocWorkflowUI();
 }
 function renderNodes(nodes, parent){
   const frag = document.createDocumentFragment();
@@ -1023,6 +1441,7 @@ function renderNodes(nodes, parent){
         markCwd();
       };
     } else {
+      row.dataset.doc = n.path;                   // presence chips attach here
       row.onclick = e => { if(e.target!==ren && e.target!==del) openDoc(n.path); };
     }
     ren.onclick = async e => {
@@ -1066,11 +1485,19 @@ function markCwd(){
 /* ------------------------------------------------------------- document --- */
 async function openDoc(path){
   if(state.dirty && !confirm("Discard unsaved changes?")) return;
+  const seq = ++state.openSeq;
   state.path = path; state.dirty = false;
   // opening a document makes its folder the current one
   state.dir = path.includes("/") ? path.split("/").slice(0,-1).join("/") : "";
-  ta.value = await api.doc(path);
-  render(); setPath(); loadTree();
+  clearConflict();
+  const r = await api.doc(path);
+  // another openDoc started while this fetch was in flight: that one wins, and
+  // overwriting ta.value here would silently discard what the user has typed
+  if(seq !== state.openSeq) return;
+  ta.value = r.text; state.etag = r.etag; state.baseText = r.text;
+  dropDraft(path);
+  render(); setPath();
+  await loadTree();                   // settles read-only for the new document
 }
 function setPath(){
   $("#docpath").textContent = state.path || "No document selected";
@@ -1080,17 +1507,213 @@ function markSaved(ok){
     (state.dirty ? "unsaved…" : "saved");
   status.style.color = ok===false ? "var(--danger)" : "var(--muted)";
 }
+/* One save in flight at a time. Without this guard two PUTs from the 1.2 s
+   debounce can overlap and land out of order, letting the older body win. */
+let saving = false, pending = false, saveTimer = null;
 async function save(){
-  if(!state.path || docReadOnly) return;
-  const r = await api.save(state.path, ta.value);
-  if(r && r.ok){ state.dirty=false; markSaved(true); }
-  else markSaved(false);
+  if(!state.path || docReadOnly || state.conflict) return;
+  if(saving){ pending = true; return; }          // coalesce, don't queue
+  saving = true;
+  const path = state.path, text = ta.value, seq = state.openSeq;
+  let r;
+  try{ r = await api.save(path, text, state.etag); }
+  catch(e){ r = null; }
+  saving = false;
+  // a different document was opened meanwhile: that reply is about the old one
+  if(seq !== state.openSeq){ pending = false; return; }
+  if(r && r.status === 409){
+    pending = false;
+    return enterConflict(r);
+  }
+  if(r && r.ok){
+    // adopting the returned etag is what keeps autosave working: otherwise the
+    // next save would collide with this one's own write
+    state.etag = r.etag; state.baseText = text;
+    if(ta.value === text){ state.dirty = false; dropDraft(path); }
+    markSaved(true);
+  } else markSaved(false);
+  if(pending){ pending = false; save(); }        // fire once for what arrived
 }
-let saveTimer=null;
 ta.addEventListener("input", () => {
-  state.dirty = true; render(); markSaved();
+  state.dirty = true; render(); markSaved(); keepDraft();
+  if(state.conflict) return;                     // paused until it is resolved
   clearTimeout(saveTimer); saveTimer=setTimeout(save, 1200);
 });
+
+/* --------------------------------------------------------- draft mirror --- */
+/* Unsaved text is mirrored to localStorage, so "Reload" and a crash or closed
+   tab during a conflict are both recoverable rather than final. */
+function keepDraft(){
+  if(!state.path) return;
+  try{ localStorage.setItem("sl-draft:" + state.path, ta.value); }catch(e){}
+}
+function dropDraft(path){
+  try{ localStorage.removeItem("sl-draft:" + path); }catch(e){}
+}
+
+/* ------------------------------------------------------ save conflicts --- */
+/* Raised either by a 409 from our own save, or pre-emptively when the change
+   feed reports someone else saved a document we have unsaved edits in. The bar
+   is persistent and non-modal, and autosave stays paused until it is resolved:
+   an alert() here would re-fire on every autosave tick. */
+function enterConflict(info){
+  state.conflict = true;
+  clearTimeout(saveTimer);
+  const who = (info && info.by) ? info.by : "someone else";
+  const when = (info && info.at) ? " at " + info.at : "";
+  if(info && info.etag) state.etag = info.etag;
+  $("#cbarMsg").textContent = "⚠ " + who + " saved a newer version of this " +
+    "document" + when + ". Your changes are not saved.";
+  $("#cbar").hidden = false;
+  status.textContent = "conflict"; status.style.color = "var(--danger)";
+}
+function clearConflict(){
+  state.conflict = false;
+  $("#cbar").hidden = true;
+  // a delete/rename notice hides the choices that no longer apply — restore them
+  $("#cOver").hidden = false; $("#cReload").hidden = false; $("#cDiff").hidden = false;
+}
+/* Keep both versions. The default: nobody's work is lost, the divergence is
+   visible in the tree, and a human merges the two. */
+$("#cCopy").onclick = async () => {
+  const mine = ta.value, dir = state.path.includes("/") ?
+    state.path.split("/").slice(0,-1).join("/") : "";
+  const base = state.path.split("/").pop().replace(/\.md$/i, "");
+  const stamp = new Date().toTimeString().slice(0,5).replace(":", "");
+  const name = base + " (mine " + (getUser() || "copy") + " " + stamp + ")";
+  const r = await api.create({parent:dir, name, type:"file"});
+  if(r.error) return alert(r.error);
+  const w = await api.save(r.path, mine, null);   // fresh document, no If-Match
+  if(w && w.error) return alert(w.error);
+  dropDraft(state.path);
+  clearConflict();
+  await loadTree();
+  state.dirty = false; state.openSeq++;           // openDoc must not warn
+  openDoc(r.path);
+};
+/* Replace their version with ours. Safe only because the server keeps the bytes
+   it is about to replace under _versions/. */
+$("#cOver").onclick = async () => {
+  const mine = ta.value;
+  const cur = await api.doc(state.path);          // fresh etag to write against
+  const w = await api.save(state.path, mine, cur.etag);
+  if(w && w.status === 409) return enterConflict(w);
+  if(!w || !w.ok) return markSaved(false);
+  state.etag = w.etag; state.baseText = mine; state.dirty = false;
+  dropDraft(state.path); clearConflict(); markSaved(true);
+};
+/* Throw ours away and take theirs. The draft mirror keeps ours recoverable. */
+$("#cReload").onclick = async () => {
+  const r = await api.doc(state.path);
+  ta.value = r.text; state.etag = r.etag; state.baseText = r.text;
+  state.dirty = false; dropDraft(state.path);
+  clearConflict(); render(); markSaved(true);
+};
+$("#cDiff").onclick = async () => {
+  const d = await api.diff(state.path, ta.value);
+  $("#metaBody").innerHTML = "<p class='ct'>Server version vs. the text in your " +
+    "editor.</p><pre class='diff'>" + (d.trim() ?
+      d.split("\n").map(l => {
+        const c = l.startsWith("+") ? "a" : l.startsWith("-") ? "d" :
+                  l.startsWith("@") ? "h" : "";
+        return c ? "<span class='" + c + "'>" + escHtml(l) + "</span>" : escHtml(l);
+      }).join("\n") : "(identical)") + "</pre>";
+  $("#meta").hidden = false;
+};
+
+/* ------------------------------------------------------- change feed ------ */
+/* A 4 s poll rather than SSE: see the server-side note — a held-open
+   EventSource would eat one of the browser's ~6 connections per origin (and
+   could not carry the presence heartbeat, which has to travel upstream). */
+let feedSeq = 0, feedTimer = null, feedWait = 4000, treeTimer = null;
+async function pollChanges(){
+  clearTimeout(feedTimer);
+  if(document.hidden || saving){                  // nothing to learn right now
+    feedTimer = setTimeout(pollChanges, feedWait);
+    return;
+  }
+  let r;
+  try{
+    r = await api.changes({since:feedSeq, client:CLIENT_ID, user:getUser(),
+                           path:state.path || "", editing:state.dirty ? 1 : 0});
+  }catch(e){
+    feedWait = 15000;                             // server down: back off
+    feedTimer = setTimeout(pollChanges, feedWait);
+    return;
+  }
+  feedWait = 4000;
+  if(r.resync){                                   // restarted or fell behind
+    feedSeq = r.seq || 0;
+    loadTree();
+  } else if(r.events && r.events.length){
+    feedSeq = r.seq;
+    for(const e of r.events) if(e.origin !== CLIENT_ID) applyChange(e);
+  } else if(r.seq !== undefined) feedSeq = r.seq;
+  presence = r.presence || {};
+  paintPresence();
+  feedTimer = setTimeout(pollChanges, feedWait);
+}
+function applyChange(e){
+  if(e.path !== state.path){                      // somewhere else in the tree
+    clearTimeout(treeTimer);                      // debounced: another user's
+    treeTimer = setTimeout(loadTree, 400);        // autosave burst is many events
+    return;
+  }
+  if(e.kind === "delete" || e.kind === "rename"){
+    const verb = e.kind === "delete" ? "deleted" : "renamed";
+    state.conflict = true; clearTimeout(saveTimer);
+    $("#cbarMsg").textContent = "⚠ " + (e.by || "someone") + " " + verb +
+      " this document. Your changes are not saved.";
+    $("#cbar").hidden = false;
+    $("#cOver").hidden = true; $("#cReload").hidden = true; $("#cDiff").hidden = true;
+    loadTree();
+    return;
+  }
+  if(e.kind !== "doc") { loadTree(); return; }    // workflow/state change
+  if(state.dirty || state.conflict){
+    // Never touch text the user is editing. Surfacing it now, seconds after
+    // their save, is the whole point: the edit is still small enough to merge.
+    if(!state.conflict) enterConflict(e);
+    return;
+  }
+  refreshOpenDoc(e.by);
+}
+async function refreshOpenDoc(by){
+  const path = state.path, seq = state.openSeq;
+  const at = ta.selectionStart, atEnd = ta.selectionEnd, top = ta.scrollTop;
+  const r = await api.doc(path);
+  if(seq !== state.openSeq || state.dirty) return;
+  ta.value = r.text; state.etag = r.etag; state.baseText = r.text;
+  ta.selectionStart = Math.min(at, r.text.length);
+  ta.selectionEnd = Math.min(atEnd, r.text.length);
+  ta.scrollTop = top;
+  render();
+  status.textContent = "updated by " + (by || "someone");
+  status.style.color = "var(--accent)";
+  setTimeout(markSaved, 2500);
+}
+
+/* --------------------------------------------------------- presence ------- */
+let presence = {};            // path -> [{user, editing}] (never includes us)
+function paintPresence(){
+  for(const row of document.querySelectorAll("#tree .row")){
+    const old = row.querySelector(".pr");
+    if(old) old.remove();
+    const peers = presence[row.dataset.doc || ""] || [];
+    if(!peers.length || !row.dataset.doc) continue;
+    const chip = document.createElement("span");
+    chip.className = "pr" + (peers.some(p => p.editing) ? " typing" : "");
+    chip.textContent = "👥" + (peers.length > 1 ? peers.length : "");
+    chip.title = peers.map(p => p.user + (p.editing ? " (typing)" : "")).join(", ");
+    row.insertBefore(chip, row.querySelector(".act"));
+  }
+  const here = (state.path && presence[state.path]) || [];
+  $("#pbar").hidden = !here.length;
+  if(here.length)
+    $("#pbarMsg").textContent = "👥 " + here.map(p => p.user).join(", ") +
+      (here.length > 1 ? " also have " : " is also editing ") +
+      (here.length > 1 ? "this document open" : "this document");
+}
 
 /* ------------------------------------------- document workflow / state --- */
 let docReadOnly = false;
@@ -1105,7 +1728,12 @@ function setReadOnly(ro){
   ta.readOnly = ro; ta.classList.toggle("ro", ro);
   $("#save").disabled = ro; $("#recAudio").disabled = ro; $("#recVideo").disabled = ro;
   $("#attachBtn").disabled = ro;
-  if(ro){ clearTimeout(saveTimer); if(state.dirty){ state.dirty = false; markSaved(); } }
+  // note: a background loadTree() lands here too, so an unresolved conflict must
+  // survive — only a genuine read-only document drops the pending edit
+  if(ro && !state.conflict){
+    clearTimeout(saveTimer);
+    if(state.dirty){ state.dirty = false; markSaved(); }
+  }
 }
 async function refreshDocWorkflowUI(){
   const asg = $("#wfAssign"), stSel = $("#wfState"), cur = $("#wfCur");
@@ -1264,7 +1892,8 @@ function insertAtCursor(text){
   const s = ta.selectionStart, e = ta.selectionEnd;
   ta.value = ta.value.slice(0,s) + text + ta.value.slice(e);
   ta.selectionStart = ta.selectionEnd = s + text.length;
-  ta.focus(); state.dirty=true; render(); markSaved();
+  ta.focus(); state.dirty=true; render(); markSaved(); keepDraft();
+  if(state.conflict) return;          // don't force a save past the conflict bar
   clearTimeout(saveTimer); saveTimer=setTimeout(save, 1200);
 }
 
@@ -1538,14 +2167,25 @@ $("#wfDelete").onclick = async () => {
 $("#userName").value = localStorage.getItem("sl-user") || "";
 $("#userName").addEventListener("input", () =>
   localStorage.setItem("sl-user", $("#userName").value));
+$("#writeToken").value = localStorage.getItem("sl-token") || "";
+$("#writeToken").addEventListener("input", () =>
+  localStorage.setItem("sl-token", $("#writeToken").value));
 
 /* --------------------------------------------------------------- boot ----- */
 (async function boot(){
-  api.whoami().then(w => { $("#clientIp").textContent = (w && w.ip) || "?"; })
-             .catch(() => { $("#clientIp").textContent = "?"; });
+  api.whoami().then(w => {
+    $("#clientIp").textContent = (w && w.ip) || "?";
+    // only show the token box on a server that actually requires one
+    if(w && w.token) $("#tokBox").hidden = false;
+  }).catch(() => { $("#clientIp").textContent = "?"; });
   await loadWorkflows();
   await loadTree();
   render(); markSaved();
+  pollChanges();
+  // coming back to a backgrounded tab should catch up at once, not in 4 s
+  document.addEventListener("visibilitychange", () => {
+    if(!document.hidden) pollChanges();
+  });
 })();
 </script>
 </body>
@@ -1554,8 +2194,189 @@ $("#userName").addEventListener("input", () =>
 
 
 # --------------------------------------------------------------------------- #
+# Concurrency self-test (--selftest)
+#
+# None of the races this guards against is reachable by clicking: one browser
+# never races itself. This drives the real HTTP surface from many threads.
+# --------------------------------------------------------------------------- #
+def selftest(host, port):
+    import urllib.error
+    import urllib.request
+
+    base = f"http://{host}:{port}"
+    failures = []
+    ran = []
+
+    def check(ok, label):
+        ran.append(label)
+        print(("  ok   " if ok else "  FAIL ") + label)
+        if not ok:
+            failures.append(label)
+
+    def call(method, path, body=None, headers=None):
+        req = urllib.request.Request(base + path, data=body, method=method,
+                                     headers=headers or {})
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status, r.read(), dict(r.headers)
+        except urllib.error.HTTPError as e:
+            return e.code, e.read(), dict(e.headers)
+        except OSError as e:
+            # a reset connection is a transport failure, not a server decision:
+            # report it as itself so it is never mistaken for lost data
+            return None, repr(e).encode(), {}
+
+    ensure_dirs()
+    httpd = Server((host, port), Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    print(f"self-test against {base} (content: {CONTENT})")
+    try:
+        doc = "_selftest.md"
+        q = "/api/doc?path=" + doc
+        call("PUT", q, b"# start\n")
+
+        # 1. Concurrent unconditional writers: all succeed, one wins, and the
+        #    winner is a whole body — never a mix of two.
+        bodies = [("# writer %02d\n" % i + "x" * i).encode() for i in range(24)]
+        codes = []
+        lock = threading.Lock()
+
+        def put(b):
+            st, _, _ = call("PUT", q, b)
+            with lock:
+                codes.append(st)
+
+        ts = [threading.Thread(target=put, args=(b,)) for b in bodies]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        check(all(c == 200 for c in codes), "24 concurrent writes all accepted")
+        _, final, _ = call("GET", q)
+        check(final in bodies, "final content is exactly one writer's body")
+
+        # 2. If-Match: exactly one of N racing conditional writers may win.
+        _, cur, head = call("GET", q)
+        tag = head.get("ETag")
+        won = []
+
+        def cput(i):
+            st, _, _ = call("PUT", q, b"# cond %d\n" % i, {"If-Match": tag})
+            with lock:
+                won.append(st)
+
+        ts = [threading.Thread(target=cput, args=(i,)) for i in range(8)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        check(won.count(200) == 1, "If-Match: exactly 1 of 8 racing writes won "
+                                   "(got %d)" % won.count(200))
+        check(won.count(409) == 7, "If-Match: the other 7 were told 409")
+
+        # 3. A stale token is refused; a fresh one is accepted.
+        st, _, _ = call("PUT", q, b"stale\n", {"If-Match": 'W/"1-deadbeefdeadbeef"'})
+        check(st == 409, "stale If-Match refused with 409")
+        _, _, head = call("GET", q)
+        st, _, _ = call("PUT", q, b"# fresh\n", {"If-Match": head.get("ETag")})
+        check(st == 200, "fresh If-Match accepted")
+
+        # 4. An out-of-band edit (git pull / vim) invalidates the token — the
+        #    case a stored revision counter could not see.
+        _, _, head = call("GET", q)
+        tag = head.get("ETag")
+        atomic_write(safe_join(doc), b"# changed on disk\n")
+        st, _, _ = call("PUT", q, b"# mine\n", {"If-Match": tag})
+        check(st == 409, "edit made directly on disk is detected as a conflict")
+
+        # 5. Displaced content is recoverable.
+        snaps = os.path.join(VERSIONS, doc)
+        check(os.path.isdir(snaps) and bool(os.listdir(snaps)),
+              "replaced versions kept under _versions/")
+
+        # 6. Concurrent state mutations: the file always parses and no accepted
+        #    write is lost (this is what the corrupt-vs-missing rule protects).
+        #    40 at once also exercises the accept backlog — with the stdlib
+        #    default of 5 the kernel resets the overflow, which used to look
+        #    exactly like lost data.
+        accepted = []
+
+        def setstate(i):
+            st, _, _ = call("PUT", "/api/state?path=_sel%02d.md" % i,
+                            json.dumps({"workflow": "wf",
+                                        "state": "s%d" % i}).encode(),
+                            {"X-User": "t%d" % i})
+            with lock:
+                accepted.append((i, st))
+
+        ts = [threading.Thread(target=setstate, args=(i,)) for i in range(40)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        dropped = [i for i, st in accepted if st is None]
+        check(not dropped, "40 simultaneous connections none reset (%d dropped)"
+                           % len(dropped))
+        data = load_state()
+        ok200 = [i for i, st in accepted if st == 200]
+        check(all("_sel%02d.md" % i in data for i in ok200),
+              "every accepted state write is present in _state.json "
+              "(%d accepted)" % len(ok200))
+
+        # 7. Rename collision refused, case-only rename allowed.
+        call("POST", "/api/create", json.dumps(
+            {"parent": "", "name": "_selA", "type": "file"}).encode())
+        call("POST", "/api/create", json.dumps(
+            {"parent": "", "name": "_selB", "type": "file"}).encode())
+        st, _, _ = call("POST", "/api/rename", json.dumps(
+            {"path": "_selA.md", "name": "_selB"}).encode())
+        check(st == 409, "rename onto an existing name refused with 409")
+        st, _, _ = call("POST", "/api/rename", json.dumps(
+            {"path": "_selA.md", "name": "_selA"}).encode())
+        check(st == 200, "case-only / same-name rename still allowed")
+
+        # 8. No temp files left behind anywhere under content/.
+        strays = [os.path.join(r, n) for r, _, fs in os.walk(CONTENT)
+                  for n in fs if n.startswith(".sl-tmp-")]
+        check(not strays, "no .sl-tmp-* files left behind (%d)" % len(strays))
+
+        # 9. The change feed saw the writes, and replays for a new client.
+        r = json.loads(call("GET", "/api/changes?since=0")[1])
+        check(r.get("seq", 0) > 0 and len(r.get("events", [])) > 0,
+              "change feed recorded events")
+        r = json.loads(call("GET", "/api/changes?since=999999")[1])
+        check(r.get("resync") is True, "a client from the future is told to resync")
+
+        # 10. With a token set, writes without it are refused.
+        global WRITE_TOKEN
+        WRITE_TOKEN = "s3cret"
+        st, _, _ = call("PUT", q, b"nope\n")
+        check(st == 403, "write without --token refused")
+        st, _, _ = call("PUT", q, b"yes\n", {"X-Token": "s3cret"})
+        check(st == 200, "write with the right token accepted")
+        WRITE_TOKEN = ""
+    finally:
+        httpd.shutdown()
+        # tidy up: remove only what this test created
+        for k in list(load_state()):
+            if k.startswith("_sel"):
+                drop_state(k)
+        for p in ("_selftest.md", "_selA.md", "_selB.md"):
+            try:
+                os.remove(safe_join(p))
+            except OSError:
+                pass
+        shutil.rmtree(os.path.join(VERSIONS, "_selftest.md"), ignore_errors=True)
+
+    print("\n%d checks, %d failures" % (len(ran), len(failures)))
+    for f in failures:
+        print("  FAILED: " + f)
+    return 1 if failures else 0
+
+
+# --------------------------------------------------------------------------- #
 def main():
-    global CONTENT, ASSETS, WORKFLOWS, STATE_FILE
+    global CONTENT, ASSETS, WORKFLOWS, STATE_FILE, VERSIONS, WRITE_TOKEN
     ap = argparse.ArgumentParser(description="social-learning document manager")
     ap.add_argument("--host", default="127.0.0.1",
                     help="IP address to bind (default 127.0.0.1)")
@@ -1563,20 +2384,34 @@ def main():
                     help="TCP port to serve on (default 8000)")
     ap.add_argument("--dir", default="content", metavar="FOLDER",
                     help="folder to serve (default ./content)")
+    ap.add_argument("--token", default="", metavar="SECRET",
+                    help="require this secret for any write (not a login: "
+                         "anyone holding it can write)")
     ap.add_argument("--noprompt", action="store_true",
                     help="start serving immediately, without waiting for Enter")
     ap.add_argument("--no-open", action="store_true", help="don't open a browser")
+    ap.add_argument("--selftest", action="store_true",
+                    help="run the concurrency self-test and exit")
     args = ap.parse_args()
 
     CONTENT = os.path.realpath(args.dir)
     ASSETS = os.path.join(CONTENT, "_assets")
     WORKFLOWS = os.path.join(CONTENT, "_workflows")
     STATE_FILE = os.path.join(WORKFLOWS, "_state.json")
+    VERSIONS = os.path.join(CONTENT, "_versions")
+    WRITE_TOKEN = args.token
     url = f"http://{args.host}:{args.port}/"
+
+    if args.selftest:
+        return selftest(args.host, args.port)
 
     print("social-learning")
     print(f"  content : {CONTENT}")
     print(f"  address : {url}")
+    if WRITE_TOKEN:
+        print("  writes  : require --token (share the token with contributors)")
+    else:
+        print("  writes  : open to anyone who can reach this address")
 
     if not args.noprompt:
         try:
@@ -1589,7 +2424,7 @@ def main():
 
     ensure_dirs()
     try:
-        httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+        httpd = Server((args.host, args.port), Handler)
     except OSError as e:
         print(f"cannot bind {args.host}:{args.port}: {e}")
         return
@@ -1604,4 +2439,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main() or 0)
