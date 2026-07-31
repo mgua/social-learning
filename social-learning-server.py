@@ -37,9 +37,12 @@ CONTENT = os.path.realpath("content")
 ASSETS = os.path.join(CONTENT, "_assets")
 WORKFLOWS = os.path.join(CONTENT, "_workflows")
 STATE_FILE = os.path.join(WORKFLOWS, "_state.json")
+TRASH = os.path.join(CONTENT, "_trash")
+TRASH_MANIFEST = os.path.join(TRASH, "_manifest.json")
 
 # _state.json is read-modify-written from several worker threads.
 STATE_LOCK = threading.Lock()
+TRASH_LOCK = threading.Lock()
 
 mimetypes.add_type("text/markdown", ".md")
 mimetypes.add_type("video/webm", ".webm")
@@ -52,6 +55,7 @@ mimetypes.add_type("audio/webm", ".weba")
 def ensure_dirs():
     os.makedirs(ASSETS, exist_ok=True)
     os.makedirs(WORKFLOWS, exist_ok=True)
+    os.makedirs(TRASH, exist_ok=True)
 
 
 def safe_join(rel):
@@ -71,7 +75,7 @@ def build_tree(path):
     except FileNotFoundError:
         return entries
     for name in names:
-        if name.startswith(".") or name in ("_assets", "_workflows"):
+        if name.startswith(".") or name in ("_assets", "_workflows", "_trash"):
             continue
         full = os.path.join(path, name)
         rel = os.path.relpath(full, CONTENT).replace(os.sep, "/")
@@ -240,6 +244,106 @@ def rename_workflow_refs(old, new):
 
 
 # --------------------------------------------------------------------------- #
+# Trash: folders are moved here instead of being permanently deleted, with a
+# sidecar manifest recording where they came from so they can be restored.
+# --------------------------------------------------------------------------- #
+def load_trash_manifest():
+    try:
+        with open(TRASH_MANIFEST, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def save_trash_manifest(data):
+    os.makedirs(TRASH, exist_ok=True)
+    with open(TRASH_MANIFEST, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+
+def record_trashed(trash_id, original_path, by):
+    with TRASH_LOCK:
+        data = load_trash_manifest()
+        data[trash_id] = {"original_path": original_path,
+                           "deleted_at": now_stamp(), "deleted_by": by}
+        save_trash_manifest(data)
+
+
+def trash_item(full, key, by):
+    """Move a file or folder into _trash/, recording its original location."""
+    os.makedirs(TRASH, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    salt = os.urandom(3).hex()
+    trash_id = f"{stamp}-{salt}-{os.path.basename(full)}"
+    dest = os.path.join(TRASH, trash_id)
+    shutil.move(full, dest)
+    record_trashed(trash_id, key, by)
+
+
+def list_trash():
+    """Newest-first list of trashed files/folders, with original location and who/when."""
+    manifest = load_trash_manifest()
+    out = []
+    try:
+        names = sorted(os.listdir(TRASH), reverse=True)
+    except FileNotFoundError:
+        names = []
+    for name in names:
+        if name == "_manifest.json":
+            continue
+        full = os.path.join(TRASH, name)
+        meta = manifest.get(name, {})
+        orig = meta.get("original_path", name)
+        out.append({
+            "id": name,
+            "name": orig.rsplit("/", 1)[-1],
+            "original_path": orig,
+            "deleted_at": meta.get("deleted_at", ""),
+            "deleted_by": meta.get("deleted_by", ""),
+            "type": "dir" if os.path.isdir(full) else "file",
+        })
+    return out
+
+
+def restore_trash(trash_id):
+    """Move a trashed file/folder back to its original location."""
+    trash_id = os.path.basename(trash_id or "")
+    src = os.path.join(TRASH, trash_id)
+    if not os.path.exists(src):
+        raise ValueError("trash entry not found")
+    with TRASH_LOCK:
+        manifest = load_trash_manifest()
+        meta = manifest.get(trash_id, {})
+        original_path = meta.get("original_path") or trash_id
+        dst = safe_join(original_path)
+        if os.path.exists(dst):
+            raise ValueError("a file or folder already exists at the original location")
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.move(src, dst)
+        manifest.pop(trash_id, None)
+        save_trash_manifest(manifest)
+    return original_path
+
+
+def purge_trash(trash_id):
+    """Permanently delete a trashed file/folder."""
+    trash_id = os.path.basename(trash_id or "")
+    full = os.path.join(TRASH, trash_id)
+    if not os.path.exists(full):
+        raise ValueError("trash entry not found")
+    with TRASH_LOCK:
+        if os.path.isdir(full):
+            shutil.rmtree(full)
+        else:
+            os.remove(full)
+        manifest = load_trash_manifest()
+        manifest.pop(trash_id, None)
+        save_trash_manifest(manifest)
+
+
+# --------------------------------------------------------------------------- #
 # HTTP handler
 # --------------------------------------------------------------------------- #
 class Handler(BaseHTTPRequestHandler):
@@ -331,6 +435,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(load_state())
             if path == "/api/whoami":
                 return self._json({"ip": self.client_address[0]})
+            if path == "/api/trash":
+                return self._json(list_trash())
             if path.startswith("/content/"):
                 return self._serve_file(safe_join(path[len("/content/"):]))
             return self._error(404, "not found")
@@ -435,6 +541,14 @@ class Handler(BaseHTTPRequestHandler):
                 rename_workflow_refs(old, new)
                 return self._json({"ok": True, "name": new})
 
+            if path == "/api/trash/restore":
+                data = json.loads(self._body() or b"{}")
+                try:
+                    original = restore_trash(data.get("id", ""))
+                except ValueError as e:
+                    return self._error(400, str(e))
+                return self._json({"ok": True, "path": original})
+
             if path == "/api/upload":
                 # X-Filename is percent-encoded by the client (headers are latin-1)
                 fn = unique_asset_name(
@@ -458,10 +572,11 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/doc":
                 full = safe_join(self._query().get("path", [""])[0])
                 key = os.path.relpath(full, CONTENT).replace(os.sep, "/")
-                if os.path.isdir(full):
-                    shutil.rmtree(full)
-                elif os.path.isfile(full):
-                    os.remove(full)
+                if os.path.isdir(full) or os.path.isfile(full):
+                    # Né i documenti né le cartelle vengono eliminati per
+                    # sempre: vengono spostati in _trash/ e registrati nel
+                    # manifest, così si possono elencare e ripristinare dalla UI.
+                    trash_item(full, key, self._who())
                 else:
                     return self._error(404, "not found")
                 drop_state(key)
@@ -471,6 +586,12 @@ class Handler(BaseHTTPRequestHandler):
                 if not os.path.isfile(full):
                     return self._error(404, "not found")
                 os.remove(full)
+                return self._json({"ok": True})
+            if path == "/api/trash":
+                try:
+                    purge_trash(self._query().get("id", [""])[0])
+                except ValueError as e:
+                    return self._error(400, str(e))
                 return self._json({"ok": True})
             return self._error(404, "not found")
         except ValueError as e:
@@ -631,6 +752,18 @@ HTML = r"""<!doctype html>
   #wfSummary .tag{font-size:11px;border-radius:4px;padding:0 5px;margin-left:5px}
   #wfSummary .tag.start{background:var(--accent);color:#0b1220}
   #wfSummary .tag.term{background:var(--ok);color:#0b1220}
+  #trashview[hidden]{display:none}
+  #trashview{flex:1;display:flex;flex-direction:column;min-width:0}
+  #trashtoolbar{display:flex;align-items:center;gap:6px;padding:6px 10px;
+    background:var(--panel);border-bottom:1px solid var(--line)}
+  #trashList{flex:1;overflow:auto;padding:12px 16px}
+  #trashList .empty{margin:20px 0;color:var(--muted);text-align:left;padding:0}
+  .trow{display:flex;align-items:center;gap:12px;padding:8px 10px;
+    border-bottom:1px solid var(--line)}
+  .trow .tn{font-weight:600;min-width:140px}
+  .trow .tp,.trow .td{font-size:12px}
+  .trow .ct{color:var(--muted)}
+  .trow .sp2{flex:1}
   select{background:var(--panel2);color:var(--fg);border:1px solid var(--line);
     border-radius:6px;padding:5px 8px;font-size:13px}
   select:hover{border-color:var(--accent)}
@@ -674,6 +807,7 @@ HTML = r"""<!doctype html>
   <h1>📚 social-learning</h1>
   <a href="#" id="about" title="Info, help &amp; Pandoc / Info, aiuto e Pandoc">ℹ Info</a>
   <a href="#" id="openWf" title="Define and edit workflows / Definisci e modifica i flussi">🔀 Workflows</a>
+  <a href="#" id="openTrash" title="View and restore deleted folders / Vedi e ripristina cartelle cancellate">🗑️ Cestino</a>
   <label class="hbox" title="Your name — used in document history / Il tuo nome — usato nella cronologia">👤
     <input id="userName" placeholder="username" spellcheck="false" autocomplete="off"></label>
   <span class="hbox ip" title="Your client IP address / Il tuo indirizzo IP">🌐 <span id="clientIp">…</span></span>
@@ -860,6 +994,15 @@ lit parse book.pdf --format markdown -o book.md</code></pre>
       <div id="wfSummary"></div>
     </div>
   </section>
+  <section id="trashview" hidden>
+    <div id="trashtoolbar">
+      <span>🗑️ Cestino</span>
+      <span class="sp" style="flex:1"></span>
+      <button id="trashRefresh" title="Reload">⟳</button>
+      <button id="trashClose">✕ Close</button>
+    </div>
+    <div id="trashList"></div>
+  </section>
 </main>
 
 <script>
@@ -894,6 +1037,11 @@ const api = {
                 {method:"PUT", headers:{"X-User":getUser()},
                  body:JSON.stringify(o)}).then(r => r.json()),
   whoami:    () => fetch("/api/whoami").then(r => r.json()),
+  trash:        () => fetch("/api/trash").then(r => r.json()),
+  trashRestore: id => fetch("/api/trash/restore", {method:"POST",
+                  body:JSON.stringify({id})}).then(r => r.json()),
+  trashPurge:   id => fetch("/api/trash?id=" + encodeURIComponent(id),
+                  {method:"DELETE"}).then(r => r.json()),
 };
 
 /* Identity: the username lives in the header box (persisted); the client IP
@@ -1041,7 +1189,10 @@ function renderNodes(nodes, parent){
     };
     del.onclick = async e => {
       e.stopPropagation();
-      if(!confirm("Delete \"" + n.name + "\"" + (isDir?" and everything inside?":"?"))) return;
+      if(!confirm("Delete \"" + n.name + "\"" +
+        (isDir ? " and everything inside?" : "") +
+        " (it will be moved to the trash, not permanently deleted)"))
+        return;
       await api.del(n.path);
       if(state.path === n.path){ state.path=null; ta.value=""; render(); setPath(); }
       // don't leave the current folder pointing at something deleted
@@ -1539,6 +1690,52 @@ $("#userName").value = localStorage.getItem("sl-user") || "";
 $("#userName").addEventListener("input", () =>
   localStorage.setItem("sl-user", $("#userName").value));
 
+/* ------------------------------------------------------------- trash --- */
+function openTrash(){
+  $("#trashview").hidden = false; $("#work").hidden = true;
+  loadTrashList();
+}
+function closeTrash(){ $("#trashview").hidden = true; $("#work").hidden = false; }
+async function loadTrashList(){
+  const items = await api.trash();
+  const el = $("#trashList");
+  if(!items.length){
+    el.innerHTML = '<div class="empty">Cestino vuoto. Le cartelle cancellate appariranno qui.</div>';
+    return;
+  }
+  el.innerHTML = "";
+  for(const it of items){
+    const row = document.createElement("div"); row.className = "trow";
+    const nm = document.createElement("span"); nm.className = "tn";
+    nm.textContent = (it.type === "dir" ? "📁 " : "📄 ") + it.name;
+    const pth = document.createElement("span"); pth.className = "tp ct";
+    pth.textContent = "da: " + (it.original_path || "?");
+    const meta = document.createElement("span"); meta.className = "td ct";
+    meta.textContent = (it.deleted_at || "") + (it.deleted_by ? " · " + it.deleted_by : "");
+    const sp = document.createElement("span"); sp.className = "sp2";
+    const restoreBtn = document.createElement("button");
+    restoreBtn.textContent = "↩ Ripristina";
+    restoreBtn.onclick = async () => {
+      const r = await api.trashRestore(it.id);
+      if(r.error) return alert(r.error);
+      await loadTrashList(); await loadTree();
+    };
+    const purgeBtn = document.createElement("button"); purgeBtn.className = "rec";
+    purgeBtn.textContent = "🗑 Elimina per sempre";
+    purgeBtn.onclick = async () => {
+      if(!confirm('Eliminare definitivamente "' + it.name + '"? Non sarà più recuperabile.')) return;
+      const r = await api.trashPurge(it.id);
+      if(r.error) return alert(r.error);
+      await loadTrashList();
+    };
+    row.append(nm, pth, meta, sp, restoreBtn, purgeBtn);
+    el.append(row);
+  }
+}
+$("#openTrash").onclick = e => { e.preventDefault(); openTrash(); };
+$("#trashClose").onclick = closeTrash;
+$("#trashRefresh").onclick = loadTrashList;
+
 /* --------------------------------------------------------------- boot ----- */
 (async function boot(){
   api.whoami().then(w => { $("#clientIp").textContent = (w && w.ip) || "?"; })
@@ -1555,7 +1752,7 @@ $("#userName").addEventListener("input", () =>
 
 # --------------------------------------------------------------------------- #
 def main():
-    global CONTENT, ASSETS, WORKFLOWS, STATE_FILE
+    global CONTENT, ASSETS, WORKFLOWS, STATE_FILE, TRASH, TRASH_MANIFEST
     ap = argparse.ArgumentParser(description="social-learning document manager")
     ap.add_argument("--host", default="127.0.0.1",
                     help="IP address to bind (default 127.0.0.1)")
@@ -1572,6 +1769,8 @@ def main():
     ASSETS = os.path.join(CONTENT, "_assets")
     WORKFLOWS = os.path.join(CONTENT, "_workflows")
     STATE_FILE = os.path.join(WORKFLOWS, "_state.json")
+    TRASH = os.path.join(CONTENT, "_trash")
+    TRASH_MANIFEST = os.path.join(TRASH, "_manifest.json")
     url = f"http://{args.host}:{args.port}/"
 
     print("social-learning")
