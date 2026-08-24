@@ -7,3 +7,6 @@ Fu aggiornato nel corso degli anni e recentemente è stato portato su Github. Ne
 Le ultime versioni hanno visto il coinvolgimento di agentic coding, prevalentemente con l'impiego di Claude.
 
 Il progetto è attualmente mantenuto da [Marco Guardigli](https://github.com/mgua) con il supporto di Klaudija Stefan e Alexandru Albano.
+
+Un contributo specifico proviene da [Alessandro Vespoli](https://github.com/Ale05-cpu), che ha introdotto il controllo per i file attachment orfani. File allegati ma non più referenziati.
+
