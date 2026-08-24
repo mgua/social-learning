@@ -240,6 +240,234 @@ def rename_workflow_refs(old, new):
 
 
 # --------------------------------------------------------------------------- #
+# Orphan attachment detection
+#
+# _assets/ holds every pasted image/file/recording; documents reference them
+# via markdown links like [name](/content/_assets/xxxx). Editing or deleting
+# documents can leave assets that no .md file points to anymore ("orphans").
+# --------------------------------------------------------------------------- #
+ASSET_REF_RE = re.compile(r"_assets/([^\s)\"'>]+)")
+
+
+def referenced_assets():
+    """Return the set of asset filenames referenced by any .md document."""
+    refs = set()
+    for root, dirs, files in os.walk(CONTENT):
+        dirs[:] = [d for d in dirs if d not in ("_assets", "_workflows")]
+        for name in files:
+            if not name.lower().endswith(".md"):
+                continue
+            try:
+                with open(os.path.join(root, name), "r", encoding="utf-8") as f:
+                    text = f.read()
+            except OSError:
+                continue
+            refs.update(unquote(m) for m in ASSET_REF_RE.findall(text))
+    return refs
+
+
+def find_orphan_assets():
+    """List files under _assets/ that no document references, newest first."""
+    refs = referenced_assets()
+    out = []
+    try:
+        names = os.listdir(ASSETS)
+    except FileNotFoundError:
+        names = []
+    for name in names:
+        if name.startswith("."):
+            continue
+        full = os.path.join(ASSETS, name)
+        if not os.path.isfile(full) or name in refs:
+            continue
+        st = os.stat(full)
+        out.append({"name": name, "size": st.st_size,
+                    "mtime": time.strftime("%Y-%m-%d %H:%M UTC",
+                                            time.gmtime(st.st_mtime))})
+    out.sort(key=lambda a: a["mtime"], reverse=True)
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Users and roles
+#
+# _users.json lists who is authorized and which fixed role(s) they hold.
+# There is no password: like the rest of the app, "who you are" is just the
+# free-text username sent by the client, so this enforces process, not real
+# security. Only an admin can add/remove users or grant/revoke the admin
+# role; anyone can add/remove the non-admin roles (editor, viewer).
+# --------------------------------------------------------------------------- #
+USERS_FILE = os.path.join(WORKFLOWS, "_users.json")
+USERS_LOCK = threading.Lock()
+ROLES = ("admin", "editor", "viewer")
+
+
+def clean_username(name):
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("username required")
+    if len(name) > 100:
+        raise ValueError("username too long")
+    if re.search(r"[\s/\\]", name):
+        raise ValueError("username may not contain spaces or slashes")
+    return name
+
+
+def load_users():
+    try:
+        with open(USERS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def save_users(data):
+    os.makedirs(WORKFLOWS, exist_ok=True)
+    with open(USERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+
+def user_roles(users, name):
+    entry = users.get(name)
+    return list(entry.get("roles", [])) if entry else []
+
+
+def is_admin(users, name):
+    return "admin" in user_roles(users, name)
+
+
+def any_admin_exists(users):
+    """True if at least one registered user currently holds the admin role."""
+    return any("admin" in (entry.get("roles") or []) for entry in users.values())
+
+
+def list_users():
+    return load_users()
+
+
+def create_user(name, roles, by):
+    """Add a new user. Admin-only, unless no admin exists yet anywhere (bootstrap)."""
+    name = clean_username(name)
+    bad = [r for r in roles if r not in ROLES]
+    if bad:
+        raise ValueError(f"unknown role(s): {', '.join(bad)}")
+    with USERS_LOCK:
+        data = load_users()
+        if name in data:
+            raise ValueError(f'user "{name}" already exists')
+        if any_admin_exists(data) and not is_admin(data, by):
+            raise ValueError("only an admin can add new users")
+        data[name] = {"roles": sorted(set(roles))}
+        save_users(data)
+        return name, data[name]
+
+
+def delete_user(name, by):
+    with USERS_LOCK:
+        data = load_users()
+        if name not in data:
+            raise ValueError("user not found")
+        if any_admin_exists(data) and not is_admin(data, by):
+            raise ValueError("only an admin can remove users")
+        data.pop(name)
+        save_users(data)
+
+
+def set_user_roles(name, roles, by):
+    """Anyone may add/remove non-admin roles; only an admin may touch 'admin'
+    -- unless no admin exists yet anywhere (bootstrap)."""
+    bad = [r for r in roles if r not in ROLES]
+    if bad:
+        raise ValueError(f"unknown role(s): {', '.join(bad)}")
+    with USERS_LOCK:
+        data = load_users()
+        if name not in data:
+            raise ValueError("user not found")
+        old_admin = "admin" in data[name]["roles"]
+        new_admin = "admin" in roles
+        if old_admin != new_admin and any_admin_exists(data) and not is_admin(data, by):
+            raise ValueError("only an admin can grant or revoke the admin role")
+        data[name]["roles"] = sorted(set(roles))
+        save_users(data)
+        return data[name]
+
+
+# --------------------------------------------------------------------------- #
+# Workflow transition permissions
+#
+# Which of the fixed roles may change a document's workflow state (advance,
+# reopen, or assign a workflow). Admin-only to configure. If no users are
+# registered yet (bootstrap), nobody is locked out.
+# --------------------------------------------------------------------------- #
+PERMISSIONS_FILE = os.path.join(WORKFLOWS, "_permissions.json")
+PERMS_LOCK = threading.Lock()
+DEFAULT_PERMISSIONS = {
+    "can_transition": ["admin", "editor"],  # who may change a document's workflow state
+    "can_edit": ["admin", "editor"],        # who may save/edit a document's content
+}
+
+
+def load_permissions():
+    try:
+        with open(PERMISSIONS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except (FileNotFoundError, ValueError):
+        data = {}
+    for key, default in DEFAULT_PERMISSIONS.items():
+        if not isinstance(data.get(key), list):
+            data[key] = list(default)
+    return data
+
+
+def save_permissions(data):
+    os.makedirs(WORKFLOWS, exist_ok=True)
+    with open(PERMISSIONS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+
+def get_permission_roles(key):
+    return load_permissions().get(key, list(DEFAULT_PERMISSIONS[key]))
+
+
+def set_permission_roles(key, roles, by):
+    """Admin-only, unless no admin exists yet anywhere (bootstrap)."""
+    bad = [r for r in roles if r not in ROLES]
+    if bad:
+        raise ValueError(f"unknown role(s): {', '.join(bad)}")
+    with PERMS_LOCK:
+        users = load_users()
+        if any_admin_exists(users) and not is_admin(users, by):
+            raise ValueError("only an admin can change permissions")
+        data = load_permissions()
+        data[key] = sorted(set(roles))
+        save_permissions(data)
+        return data[key]
+
+
+def can_change_state(by):
+    """True if this user may change a document's workflow state right now."""
+    users = load_users()
+    if not users:
+        return True  # no roster configured yet: don't lock anyone out
+    allowed = set(get_permission_roles("can_transition"))
+    return bool(allowed & set(user_roles(users, by)))
+
+
+def can_edit_docs(by):
+    """True if this user may save/edit a document's content right now."""
+    users = load_users()
+    if not users:
+        return True
+    allowed = set(get_permission_roles("can_edit"))
+    return bool(allowed & set(user_roles(users, by)))
+
+
+# --------------------------------------------------------------------------- #
 # HTTP handler
 # --------------------------------------------------------------------------- #
 class Handler(BaseHTTPRequestHandler):
@@ -331,6 +559,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(load_state())
             if path == "/api/whoami":
                 return self._json({"ip": self.client_address[0]})
+            if path == "/api/orphans":
+                return self._json(find_orphan_assets())
+            if path == "/api/users":
+                return self._json(list_users())
+            if path == "/api/permissions":
+                return self._json(load_permissions())
             if path.startswith("/content/"):
                 return self._serve_file(safe_join(path[len("/content/"):]))
             return self._error(404, "not found")
@@ -352,6 +586,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not full.lower().endswith(".md"):
                     return self._error(400, "only .md documents")
                 key = os.path.relpath(full, CONTENT).replace(os.sep, "/")
+                if not can_edit_docs(self._who()):
+                    return self._error(403, "you don't have permission to edit documents")
                 entry = load_state().get(key)
                 if entry and entry.get("terminal"):
                     return self._error(403, "document is read-only (terminal state)")
@@ -369,13 +605,35 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/state":
                 full = safe_join(self._query().get("path", [""])[0])
                 key = os.path.relpath(full, CONTENT).replace(os.sep, "/")
+                by = self._who()
+                if not can_change_state(by):
+                    return self._error(403, "you don't have permission to change workflow state")
                 data = json.loads(self._body() or b"{}")
                 wf = (data.get("workflow") or "").strip()
                 st = (data.get("state") or "").strip()
                 ev = (data.get("event") or "").strip()
                 term = bool(data.get("terminal"))
-                entry = set_doc_state(key, wf, st, ev, term, self._who())
+                entry = set_doc_state(key, wf, st, ev, term, by)
                 return self._json({"ok": True, "state": entry})
+            if path == "/api/users":
+                name = self._query().get("name", [""])[0]
+                data = json.loads(self._body() or b"{}")
+                try:
+                    entry = set_user_roles(name, data.get("roles", []), self._who())
+                except ValueError as e:
+                    return self._error(400, str(e))
+                return self._json({"ok": True, "name": name, "roles": entry["roles"]})
+            if path == "/api/permissions":
+                data = json.loads(self._body() or b"{}")
+                by = self._who()
+                try:
+                    result = {}
+                    for key in ("can_transition", "can_edit"):
+                        if key in data:
+                            result[key] = set_permission_roles(key, data[key], by)
+                except ValueError as e:
+                    return self._error(400, str(e))
+                return self._json({"ok": True, **result})
             return self._error(404, "not found")
         except ValueError as e:
             return self._error(400, str(e))
@@ -435,6 +693,15 @@ class Handler(BaseHTTPRequestHandler):
                 rename_workflow_refs(old, new)
                 return self._json({"ok": True, "name": new})
 
+            if path == "/api/users":
+                data = json.loads(self._body() or b"{}")
+                try:
+                    name, entry = create_user(data.get("name", ""),
+                                               data.get("roles", []), self._who())
+                except ValueError as e:
+                    return self._error(400, str(e))
+                return self._json({"ok": True, "name": name, "roles": entry["roles"]})
+
             if path == "/api/upload":
                 # X-Filename is percent-encoded by the client (headers are latin-1)
                 fn = unique_asset_name(
@@ -471,6 +738,13 @@ class Handler(BaseHTTPRequestHandler):
                 if not os.path.isfile(full):
                     return self._error(404, "not found")
                 os.remove(full)
+                return self._json({"ok": True})
+            if path == "/api/users":
+                name = self._query().get("name", [""])[0]
+                try:
+                    delete_user(name, self._who())
+                except ValueError as e:
+                    return self._error(400, str(e))
                 return self._json({"ok": True})
             return self._error(404, "not found")
         except ValueError as e:
@@ -606,9 +880,9 @@ HTML = r"""<!doctype html>
     background:#fff;margin-right:6px;animation:blink 1s steps(2) infinite}
   @keyframes blink{50%{opacity:.2}}
   /* workflows */
-  header #openWf{color:var(--accent);text-decoration:none;font-size:12px;
+  header #openWf,header #openOrphans,header #openUsers{color:var(--accent);text-decoration:none;font-size:12px;
     border:1px solid var(--line);border-radius:6px;padding:4px 8px}
-  header #openWf:hover{border-color:var(--accent);background:var(--panel2)}
+  header #openWf:hover,header #openOrphans:hover,header #openUsers:hover{border-color:var(--accent);background:var(--panel2)}
   #work[hidden],#wfview[hidden]{display:none}
   #wfview{flex:1;display:flex;flex-direction:column;min-width:0}
   #wftoolbar{display:flex;align-items:center;gap:6px;padding:6px 10px;
@@ -631,6 +905,36 @@ HTML = r"""<!doctype html>
   #wfSummary .tag{font-size:11px;border-radius:4px;padding:0 5px;margin-left:5px}
   #wfSummary .tag.start{background:var(--accent);color:#0b1220}
   #wfSummary .tag.term{background:var(--ok);color:#0b1220}
+  #orphansview[hidden]{display:none}
+  #orphansview{flex:1;display:flex;flex-direction:column;min-width:0}
+  #orphanstoolbar{display:flex;align-items:center;gap:6px;padding:6px 10px;
+    background:var(--panel);border-bottom:1px solid var(--line)}
+  #orphansList{flex:1;overflow:auto;padding:12px 16px}
+  #orphansList .empty{margin:20px 0;color:var(--muted);text-align:left;padding:0}
+  .orow{display:flex;align-items:center;gap:12px;padding:8px 10px;
+    border-bottom:1px solid var(--line)}
+  .orow .on{font-weight:600;min-width:220px;word-break:break-all;
+    color:var(--accent);text-decoration:none}
+  .orow .on:hover{text-decoration:underline}
+  .orow .os,.orow .od{font-size:12px;color:var(--muted)}
+  #usersview[hidden]{display:none}
+  #usersview{flex:1;display:flex;flex-direction:column;min-width:0}
+  #userstoolbar{display:flex;align-items:center;gap:6px;padding:6px 10px;
+    background:var(--panel);border-bottom:1px solid var(--line)}
+  #usersNew{display:flex;align-items:center;gap:10px;padding:10px 16px;
+    border-bottom:1px solid var(--line);flex-wrap:wrap}
+  #newUserName{background:var(--panel2);color:var(--fg);
+    border:1px solid var(--line);border-radius:6px;padding:5px 8px;font-size:13px}
+  #usersNew label{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:4px}
+  #usersPermsTransition,#usersPermsEdit{display:flex;align-items:center;gap:10px;padding:10px 16px;
+    border-bottom:1px solid var(--line);flex-wrap:wrap;font-size:12px;color:var(--muted)}
+  #usersPermsTransition label,#usersPermsEdit label{display:flex;align-items:center;gap:4px}
+  #usersList{flex:1;overflow:auto;padding:12px 16px}
+  #usersList .empty{margin:20px 0;color:var(--muted);text-align:left;padding:0}
+  .urow{display:flex;align-items:center;gap:14px;padding:8px 10px;
+    border-bottom:1px solid var(--line);flex-wrap:wrap}
+  .urow .un{font-weight:600;min-width:120px}
+  .urow label{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:4px}
   select{background:var(--panel2);color:var(--fg);border:1px solid var(--line);
     border-radius:6px;padding:5px 8px;font-size:13px}
   select:hover{border-color:var(--accent)}
@@ -674,6 +978,8 @@ HTML = r"""<!doctype html>
   <h1>📚 social-learning</h1>
   <a href="#" id="about" title="Info, help &amp; Pandoc / Info, aiuto e Pandoc">ℹ Info</a>
   <a href="#" id="openWf" title="Define and edit workflows / Definisci e modifica i flussi">🔀 Workflows</a>
+  <a href="#" id="openOrphans" title="Check for unreferenced attachments">🧹 Orphan attachments</a>
+  <a href="#" id="openUsers" title="Manage authorized users and roles">🛡️ Users</a>
   <label class="hbox" title="Your name — used in document history / Il tuo nome — usato nella cronologia">👤
     <input id="userName" placeholder="username" spellcheck="false" autocomplete="off"></label>
   <span class="hbox ip" title="Your client IP address / Il tuo indirizzo IP">🌐 <span id="clientIp">…</span></span>
@@ -860,6 +1166,44 @@ lit parse book.pdf --format markdown -o book.md</code></pre>
       <div id="wfSummary"></div>
     </div>
   </section>
+  <section id="orphansview" hidden>
+    <div id="orphanstoolbar">
+      <span>🧹 Orphan attachments</span>
+      <span class="sp" style="flex:1"></span>
+      <button id="orphansRefresh" title="Reload">⟳</button>
+      <button id="orphansClose">✕ Close</button>
+    </div>
+    <div id="orphansList"></div>
+  </section>
+  <section id="usersview" hidden>
+    <div id="userstoolbar">
+      <span>🛡️ Authorized users</span>
+      <span class="sp" style="flex:1"></span>
+      <button id="usersRefresh" title="Reload">⟳</button>
+      <button id="usersClose">✕ Close</button>
+    </div>
+    <div id="usersNew">
+      <input id="newUserName" placeholder="username" spellcheck="false" autocomplete="off">
+      <label><input type="checkbox" class="newUserRole" value="admin"> admin</label>
+      <label><input type="checkbox" class="newUserRole" value="editor"> editor</label>
+      <label><input type="checkbox" class="newUserRole" value="viewer"> viewer</label>
+      <button id="addUserBtn" class="pri">+ Add user</button>
+    </div>
+    <div id="usersPermsTransition">
+      <span>Can change document workflow state:</span>
+      <label><input type="checkbox" class="permRole" data-perm="can_transition" value="admin"> admin</label>
+      <label><input type="checkbox" class="permRole" data-perm="can_transition" value="editor"> editor</label>
+      <label><input type="checkbox" class="permRole" data-perm="can_transition" value="viewer"> viewer</label>
+    </div>
+    <div id="usersPermsEdit">
+      <span>Can edit document content:</span>
+      <label><input type="checkbox" class="permRole" data-perm="can_edit" value="admin"> admin</label>
+      <label><input type="checkbox" class="permRole" data-perm="can_edit" value="editor"> editor</label>
+      <label><input type="checkbox" class="permRole" data-perm="can_edit" value="viewer"> viewer</label>
+      <button id="savePermsBtn">Save permissions</button>
+    </div>
+    <div id="usersList"></div>
+  </section>
 </main>
 
 <script>
@@ -869,7 +1213,7 @@ const api = {
   tree:      () => fetch("/api/tree").then(r => r.json()),
   doc:       p => fetch("/api/doc?path=" + encodeURIComponent(p)).then(r => r.text()),
   save:      (p, t) => fetch("/api/doc?path=" + encodeURIComponent(p),
-                {method:"PUT", body:t}).then(r => r.json()),
+                {method:"PUT", headers:{"X-User":getUser()}, body:t}).then(r => r.json()),
   create:    d => fetch("/api/create", {method:"POST",
                 headers:{"X-User":getUser()}, body:JSON.stringify(d)}).then(r => r.json()),
   rename:    d => fetch("/api/rename", {method:"POST",
@@ -894,6 +1238,20 @@ const api = {
                 {method:"PUT", headers:{"X-User":getUser()},
                  body:JSON.stringify(o)}).then(r => r.json()),
   whoami:    () => fetch("/api/whoami").then(r => r.json()),
+  orphans:   () => fetch("/api/orphans").then(r => r.json()),
+  users:        () => fetch("/api/users").then(r => r.json()),
+  addUser:      (name, roles) => fetch("/api/users", {method:"POST",
+                  headers:{"X-User":getUser()},
+                  body:JSON.stringify({name, roles})}).then(r => r.json()),
+  setUserRoles: (name, roles) => fetch("/api/users?name=" + encodeURIComponent(name),
+                  {method:"PUT", headers:{"X-User":getUser()},
+                   body:JSON.stringify({roles})}).then(r => r.json()),
+  delUser:      name => fetch("/api/users?name=" + encodeURIComponent(name),
+                  {method:"DELETE", headers:{"X-User":getUser()}}).then(r => r.json()),
+  permissions:    () => fetch("/api/permissions").then(r => r.json()),
+  setPermissions: body => fetch("/api/permissions", {method:"PUT",
+                    headers:{"X-User":getUser()},
+                    body:JSON.stringify(body)}).then(r => r.json()),
 };
 
 /* Identity: the username lives in the header box (persisted); the client IP
@@ -1080,11 +1438,14 @@ function markSaved(ok){
     (state.dirty ? "unsaved…" : "saved");
   status.style.color = ok===false ? "var(--danger)" : "var(--muted)";
 }
-async function save(){
+async function save(manual){
   if(!state.path || docReadOnly) return;
   const r = await api.save(state.path, ta.value);
   if(r && r.ok){ state.dirty=false; markSaved(true); }
-  else markSaved(false);
+  else {
+    markSaved(false);
+    if(r && r.error && manual) alert(r.error);
+  }
 }
 let saveTimer=null;
 ta.addEventListener("input", () => {
@@ -1236,7 +1597,7 @@ $("#upDir").onclick = () => {
   loadTree();
 };
 $("#refresh").onclick = loadTree;
-$("#save").onclick = save;
+$("#save").onclick = () => save(true);
 $("#about").onclick = e => { e.preventDefault(); $("#modal").hidden = false; };
 $("#closeAbout").onclick = () => { $("#modal").hidden = true; };
 $("#modal").onclick = e => { if(e.target === $("#modal")) $("#modal").hidden = true; };
@@ -1252,7 +1613,7 @@ function setMode(cls, btn){
   $(btn).classList.add("pri");
 }
 document.addEventListener("keydown", e => {
-  if((e.ctrlKey||e.metaKey) && e.key==="s"){ e.preventDefault(); save(); }
+  if((e.ctrlKey||e.metaKey) && e.key==="s"){ e.preventDefault(); save(true); }
 });
 window.addEventListener("beforeunload", e => {
   if(state.dirty){ e.preventDefault(); e.returnValue=""; }
@@ -1539,6 +1900,127 @@ $("#userName").value = localStorage.getItem("sl-user") || "";
 $("#userName").addEventListener("input", () =>
   localStorage.setItem("sl-user", $("#userName").value));
 
+/* ------------------------------------------------------ allegati orfani --- */
+function openOrphans(){
+  $("#orphansview").hidden = false; $("#work").hidden = true;
+  loadOrphansList();
+}
+function closeOrphans(){ $("#orphansview").hidden = true; $("#work").hidden = false; }
+function fmtBytes(n){
+  if(n < 1024) return n + " B";
+  if(n < 1024*1024) return (n/1024).toFixed(1) + " KB";
+  return (n/1024/1024).toFixed(1) + " MB";
+}
+async function loadOrphansList(){
+  const items = await api.orphans();
+  const el = $("#orphansList");
+  if(!items.length){
+    el.innerHTML = '<div class="empty">No orphan attachments found. ' +
+      'All files in _assets/ are referenced by at least one document.</div>';
+    return;
+  }
+  el.innerHTML = "";
+  for(const it of items){
+    const row = document.createElement("div"); row.className = "orow";
+    const nm = document.createElement("a"); nm.className = "on";
+    nm.href = "/content/_assets/" + encodeURIComponent(it.name);
+    nm.target = "_blank"; nm.rel = "noopener";
+    nm.title = "Open / download this file";
+    nm.textContent = "📎 " + it.name;
+    const sz = document.createElement("span"); sz.className = "os";
+    sz.textContent = fmtBytes(it.size);
+    const dt = document.createElement("span"); dt.className = "od";
+    dt.textContent = it.mtime;
+    row.append(nm, sz, dt);
+    el.append(row);
+  }
+}
+$("#openOrphans").onclick = e => { e.preventDefault(); openOrphans(); };
+$("#orphansClose").onclick = closeOrphans;
+$("#orphansRefresh").onclick = loadOrphansList;
+
+/* ---------------------------------------------------------------- utenti --- */
+const ROLE_LIST = ["admin", "editor", "viewer"];
+function openUsers(){
+  $("#usersview").hidden = false; $("#work").hidden = true;
+  loadUsersList();
+}
+function closeUsers(){ $("#usersview").hidden = true; $("#work").hidden = false; }
+async function loadUsersList(){
+  const users = await api.users();
+  const el = $("#usersList");
+  const names = Object.keys(users).sort();
+  if(!names.length){
+    el.innerHTML = '<div class="empty">No users registered yet. ' +
+      'Add the first user above (it will become the first admin).</div>';
+    return;
+  }
+  el.innerHTML = "";
+  for(const name of names){
+    const roles = users[name].roles || [];
+    const row = document.createElement("div"); row.className = "urow";
+    const nm = document.createElement("span"); nm.className = "un"; nm.textContent = name;
+    row.append(nm);
+    const checks = {};
+    for(const r of ROLE_LIST){
+      const lbl = document.createElement("label");
+      const cb = document.createElement("input");
+      cb.type = "checkbox"; cb.checked = roles.includes(r);
+      checks[r] = cb;
+      lbl.append(cb, document.createTextNode(" " + r));
+      row.append(lbl);
+    }
+    const saveBtn = document.createElement("button");
+    saveBtn.textContent = "Save roles";
+    saveBtn.onclick = async () => {
+      const newRoles = ROLE_LIST.filter(r => checks[r].checked);
+      const r = await api.setUserRoles(name, newRoles);
+      if(r.error) return alert(r.error);
+      await loadUsersList();
+    };
+    const delBtn = document.createElement("button"); delBtn.className = "rec";
+    delBtn.textContent = "🗑 Remove";
+    delBtn.onclick = async () => {
+      if(!confirm('Remove user "' + name + '" from the list?')) return;
+      const r = await api.delUser(name);
+      if(r.error) return alert(r.error);
+      await loadUsersList();
+    };
+    row.append(saveBtn, delBtn);
+    el.append(row);
+  }
+}
+async function loadPermsPanel(){
+  const perms = await api.permissions();
+  document.querySelectorAll(".permRole").forEach(cb => {
+    const allowed = perms[cb.dataset.perm] || [];
+    cb.checked = allowed.includes(cb.value);
+  });
+}
+$("#openUsers").onclick = e => { e.preventDefault(); openUsers(); loadPermsPanel(); };
+$("#usersClose").onclick = closeUsers;
+$("#usersRefresh").onclick = () => { loadUsersList(); loadPermsPanel(); };
+$("#savePermsBtn").onclick = async () => {
+  const body = {};
+  for(const key of ["can_transition", "can_edit"]){
+    body[key] = [...document.querySelectorAll('.permRole[data-perm="' + key + '"]:checked')]
+      .map(cb => cb.value);
+  }
+  const r = await api.setPermissions(body);
+  if(r.error) return alert(r.error);
+  await loadPermsPanel();
+};
+$("#addUserBtn").onclick = async () => {
+  const name = $("#newUserName").value.trim();
+  if(!name) return alert("Enter a username.");
+  const roles = [...document.querySelectorAll(".newUserRole:checked")].map(cb => cb.value);
+  const r = await api.addUser(name, roles);
+  if(r.error) return alert(r.error);
+  $("#newUserName").value = "";
+  document.querySelectorAll(".newUserRole").forEach(cb => cb.checked = false);
+  await loadUsersList();
+};
+
 /* --------------------------------------------------------------- boot ----- */
 (async function boot(){
   api.whoami().then(w => { $("#clientIp").textContent = (w && w.ip) || "?"; })
@@ -1566,12 +2048,26 @@ def main():
     ap.add_argument("--noprompt", action="store_true",
                     help="start serving immediately, without waiting for Enter")
     ap.add_argument("--no-open", action="store_true", help="don't open a browser")
+    ap.add_argument("--check-orphans", action="store_true",
+                    help="list _assets files no document references, then exit")
     args = ap.parse_args()
 
     CONTENT = os.path.realpath(args.dir)
     ASSETS = os.path.join(CONTENT, "_assets")
     WORKFLOWS = os.path.join(CONTENT, "_workflows")
     STATE_FILE = os.path.join(WORKFLOWS, "_state.json")
+
+    if args.check_orphans:
+        ensure_dirs()
+        orphans = find_orphan_assets()
+        if not orphans:
+            print("No orphan assets found.")
+        else:
+            print(f"Found {len(orphans)} orphan asset(s) in {ASSETS}:")
+            for o in orphans:
+                print(f"  {o['name']}  ({o['size']} bytes, modified {o['mtime']})")
+        return
+
     url = f"http://{args.host}:{args.port}/"
 
     print("social-learning")
