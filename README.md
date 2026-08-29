@@ -6,8 +6,12 @@ drop links (YouTube links become clickable thumbnails), and record audio/video
 straight from the browser.
 
 The entire application — web server, HTML, CSS and JavaScript — is one file
-(`app.py`) using only the Python 3.10+ standard library. **No dependencies, no
-build step, no login.**
+(`social-learning-server.py`) using only the Python 3.10+ standard library.
+**No dependencies, no build step, no login.**
+
+Several people can share one server: the sidebar refreshes on its own, a 👥 badge
+shows who else has a document open, and if two of you save the same document the
+second save is stopped so you can choose what to keep — nobody's text is lost.
 
 **social-learning** has been created in 2020 by [Neta srl](https://neta.it), and 
 subsequently evolved.
@@ -17,9 +21,11 @@ with the help of Anthropic Claude.
 ## Run
 
 ```sh
-python3 app.py                 # serves http://127.0.0.1:8000 and opens a browser
-python3 app.py --port 9000     # pick a port
-python3 app.py --no-open       # don't launch a browser
+python3 social-learning-server.py                # http://127.0.0.1:8000, opens a browser
+python3 social-learning-server.py --port 9000    # pick a port
+python3 social-learning-server.py --host 0.0.0.0 # let others on your network in
+python3 social-learning-server.py --token SECRET # require a secret to write
+python3 social-learning-server.py --no-open      # don't launch a browser
 ```
 
 Stop with `Ctrl+C`.
@@ -34,7 +40,13 @@ contributors just add or edit documents and `git push`.
 content/
   <folder>/<document>.md    one markdown file per document; folders form the tree
   _assets/                  pasted images/files and audio/video recordings
+  _versions/                the previous text of anything overwritten or deleted
+  _workflows/               workflow definitions and each document's state
 ```
+
+Changes made outside the app — a `git pull`, another editor — are noticed rather
+than silently overwritten: a save that was based on text somebody has since
+replaced is stopped and shown to you.
 
 ## Using it
 
@@ -45,8 +57,13 @@ content/
 - **Paste:** paste an image and it's uploaded and embedded; paste any other file
   and it's stored and inserted as a download link. Pasted URLs are clickable in
   the preview; YouTube links render as clickable thumbnails.
+- **Attach:** 📎 picks any file, or drag one onto the editor.
 - **Record:** 🎤 audio and 🎥 video use the browser camera/mic (`MediaRecorder`);
   the clip is saved into `content/_assets/` and embedded as a player.
+- **Together:** an idle editor picks up someone else's save on its own. If you
+  have unsaved changes when they save, your text is left alone and a bar offers
+  **Save as a copy** (keeps both), **Overwrite**, **Reload**, or **Show
+  differences**. Whatever gets replaced is kept under `content/_versions/`.
 
 
 ## Integrations
@@ -63,7 +80,20 @@ and content updates.
 ```
 
 
+## Sharing a server
+
+`--host 0.0.0.0` lets other people on your network use the same server, and
+`--token SECRET` then requires that secret for any write (contributors paste it
+into the 🔑 box in the header). Be clear about what this is: a shared password,
+not accounts. The name in the 👤 box is self-declared, so "saved by alice" is a
+helpful hint and not proof. Don't put this on an untrusted network yet.
+
 ## Roadmap
 
-- Server deployment with user login/auth (the current design is single-user,
-  local-only, and intentionally trusts the local filesystem).
+- Real user login/auth, so identity and attribution can be trusted (writes can
+  be gated with `--token` today, but that is a shared secret, not accounts).
+- Simultaneous typing in the same paragraph is deliberately not supported: it
+  would need a hand-written OT/CRDT and an operation log, which would make the
+  `.md` files a render target instead of the source of truth and break the
+  git-as-datastore model. Concurrent *use* is supported; concurrent typing in
+  one paragraph is not.
